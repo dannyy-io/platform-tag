@@ -25,7 +25,8 @@ const http = require("http");
 const { Server } = require("socket.io");
 
 const app = express();
-const PORT = 3000;
+// Hosting services (and Docker setups) often pick the port with a PORT environment variable.
+const PORT = process.env.PORT || 3000;
 
 // Any file inside the "public" folder can be requested by the browser.
 // Visiting http://localhost:3000/ serves public/index.html automatically.
@@ -283,6 +284,8 @@ setInterval(() => {
   io.emit("state", state);
 }, 1000 / TICK_RATE);
 
-server.listen(PORT, () => {
+// "0.0.0.0" means "accept connections from any network", not just this computer.
+// Inside Docker that matters: otherwise only the container itself could connect.
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`Game running at http://localhost:${PORT}`);
 });
