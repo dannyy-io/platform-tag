@@ -287,6 +287,7 @@ setInterval(() => {
 
   // Send only what browsers need to draw (not velocities, inputs, or timers).
   const state = {
+    time: now, // when this update happened (server's clock), so browsers can line updates up in time
     players: {},
     round: {
       phase: round.phase,
