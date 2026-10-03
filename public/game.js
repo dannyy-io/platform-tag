@@ -19,6 +19,34 @@ const platforms = [
   { x: 340, y: 130, width: 100, height: 15 },
 ];
 
+// ===== Multiplayer =====
+// Open a live connection to the server we were loaded from.
+const socket = io();
+
+// The other players, keyed by id: { "abc123": { id, x, y, color }, ... }
+const otherPlayers = {};
+let myColor = "#e63946"; // red until the server gives us our color
+
+// The server tells us who's already here (this list includes us too).
+socket.on("currentPlayers", (players) => {
+  for (const id in players) {
+    if (id === socket.id) myColor = players[id].color;
+    else otherPlayers[id] = players[id];
+  }
+});
+
+// Someone new joined after us.
+socket.on("newPlayer", (p) => { otherPlayers[p.id] = p; });
+
+// Someone else moved.
+socket.on("playerMoved", (data) => {
+  const p = otherPlayers[data.id];
+  if (p) { p.x = data.x; p.y = data.y; }
+});
+
+// Someone left.
+socket.on("playerLeft", (id) => { delete otherPlayers[id]; });
+
 // ===== Keyboard input =====
 // We remember which keys are currently held down.
 const keys = {};
@@ -73,13 +101,26 @@ function draw() {
   ctx.fillStyle = "#3a7d44"; // green platforms
   for (const p of platforms) ctx.fillRect(p.x, p.y, p.width, p.height);
 
-  ctx.fillStyle = "#e63946"; // red player
+  // Other players: same size squares, in their own colors
+  for (const id in otherPlayers) {
+    const p = otherPlayers[id];
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x, p.y, player.width, player.height);
+  }
+
+  // Me, with a "you" label above my head
+  ctx.fillStyle = myColor;
   ctx.fillRect(player.x, player.y, player.width, player.height);
+  ctx.fillStyle = "#000";
+  ctx.font = "12px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("you", player.x + player.width / 2, player.y - 6);
 }
 
 // ===== Game loop: update, draw, repeat (about 60 times per second) =====
 function gameLoop() {
   update();
+  socket.emit("move", { x: player.x, y: player.y }); // tell the server where I am
   draw();
   requestAnimationFrame(gameLoop); // ask the browser to call us again next frame
 }
