@@ -28,9 +28,19 @@ const socket = io();
 // Filled in by the server when we join.
 let myId = null;
 
-// The level and player size come from physics.js, the same file the server uses.
-const platforms = Physics.PLATFORMS;
+// The map ({ width, height, platforms }) comes from the server when we join.
+// null until then. The player size comes from physics.js, the same file the server uses.
+let map = null;
 const playerSize = Physics.PLAYER_SIZE;
+
+// ===== Camera =====
+// The map is much bigger than the canvas, so we only draw the part around our player.
+// camera.x / camera.y is the map position shown at the canvas's top-left corner.
+// null until we know where our player is, so the first frame can jump straight there.
+let camera = null;
+// How quickly the camera catches up with the player. Bigger = snappier, smaller = floatier.
+// Each second, the camera closes all but about e^-CAMERA_SPEED of the distance (8 means 99.97%).
+const CAMERA_SPEED = 8;
 
 // Every player's position and color, from the server's latest update:
 // { "abc123": { x, y, color, it, frozen }, ... }
@@ -49,12 +59,15 @@ let pendingInputs = [];
 // null until the first update from the server (we need its starting point).
 let predicted = null;
 
-// When we join, the server tells us our id. (If we reconnect we get a new id, so start fresh.)
+// When we join, the server tells us our id and sends the map.
+// (If we reconnect we get a new id and a new spawn spot, so start fresh.)
 socket.on("init", (data) => {
   myId = data.id;
+  map = data.map;
   inputSeq = 0;
   pendingInputs = [];
   predicted = null;
+  camera = null;
 });
 
 // Recent updates from the server, oldest first: [{ time, players }, ...]
@@ -98,7 +111,7 @@ socket.on("state", (state) => {
 // So we start from the server's position and quickly redo every input it hasn't run yet.
 // If our guesses were right, we end up exactly where we already were, so nothing visibly changes.
 function reconcile(me) {
-  if (!me) return;
+  if (!me || !map) return;
 
   // The server has run these already, so we never need them again.
   pendingInputs = pendingInputs.filter((input) => input.seq > me.lastSeq);
@@ -113,7 +126,7 @@ function reconcile(me) {
     frozenSteps: me.frozenSteps,
   };
   // 2. ...then replay every input the server hasn't got to yet.
-  for (const input of pendingInputs) Physics.stepPlayer(predicted, input);
+  for (const input of pendingInputs) Physics.stepPlayer(predicted, input, map);
 }
 
 // ===== Fixed time step =====
@@ -149,7 +162,7 @@ function physicsStep() {
   // Normally the server answers long before this fills up. This just stops it growing forever.
   if (pendingInputs.length > 120) pendingInputs.shift();
 
-  if (predictionOn && predicted) Physics.stepPlayer(predicted, stepInput);
+  if (predictionOn && predicted) Physics.stepPlayer(predicted, stepInput, map);
 }
 
 // Where every player should be drawn right now.
@@ -220,12 +233,21 @@ socket.on("pong-check", (sentAt) => {
 const input = { left: false, right: false, jump: false };
 
 // Which keyboard key controls which action.
-const keyToAction = { ArrowLeft: "left", ArrowRight: "right", Space: "jump" };
+// Several keys can do the same thing (A or the left arrow both move left).
+const keyToAction = { ArrowLeft: "left", KeyA: "left", ArrowRight: "right", KeyD: "right", Space: "jump" };
+
+// Every key code currently held down.
+const heldKeys = new Set();
 
 // Just remember what's held. physicsStep() sends it to the server every step.
+// An action is on while ANY of its keys is held, so letting go of A while still
+// holding the left arrow keeps you moving left.
 function setKey(code, held) {
   const action = keyToAction[code];
-  if (action) input[action] = held;
+  if (!action) return;
+  if (held) heldKeys.add(code);
+  else heldKeys.delete(code);
+  input[action] = [...heldKeys].some((k) => keyToAction[k] === action);
 }
 
 window.addEventListener("keydown", (e) => {
@@ -248,16 +270,65 @@ window.addEventListener("blur", () => {
   for (const code in keyToAction) setKey(code, false);
 });
 
+// ===== Camera: smoothly follow our own player =====
+// dt is how many seconds passed since the last frame.
+function updateCamera(me, dt) {
+  // Where the camera wants to be: our player in the middle of the canvas...
+  let targetX = me.x + playerSize / 2 - canvas.width / 2;
+  let targetY = me.y + playerSize / 2 - canvas.height / 2;
+  // ...but never showing past the map's edges.
+  targetX = Math.max(0, Math.min(map.width - canvas.width, targetX));
+  targetY = Math.max(0, Math.min(map.height - canvas.height, targetY));
+
+  if (camera === null) {
+    camera = { x: targetX, y: targetY }; // first frame: jump straight there
+    return;
+  }
+
+  // Move part of the way toward the target each frame. The further behind it is, the faster
+  // it moves, so it glides to a stop. Using dt keeps it the same speed at any frame rate.
+  const amount = 1 - Math.exp(-CAMERA_SPEED * dt);
+  camera.x += (targetX - camera.x) * amount;
+  camera.y += (targetY - camera.y) * amount;
+}
+
 // ===== Draw: run any physics steps that are due, then paint the world =====
+let lastDrawTime = performance.now();
+
 function draw() {
   runPhysicsSteps();
 
+  const now = performance.now();
+  const dt = Math.min(0.1, (now - lastDrawTime) / 1000); // seconds (capped, in case the tab was hidden)
+  lastDrawTime = now;
+
   ctx.clearRect(0, 0, canvas.width, canvas.height); // wipe last frame
 
-  ctx.fillStyle = "#3a7d44"; // green platforms
-  for (const p of platforms) ctx.fillRect(p.x, p.y, p.width, p.height);
+  if (map) drawWorld(dt);
 
+  drawRoundInfo();
+  drawPing();
+
+  requestAnimationFrame(draw); // ask the browser to call us again next frame
+}
+
+// Everything that lives on the map (platforms and players), drawn through the camera.
+function drawWorld(dt) {
   const drawn = playersToDraw();
+  if (drawn[myId]) updateCamera(drawn[myId], dt);
+  if (camera === null) return; // we haven't appeared yet
+
+  // Shift everything we draw from now on by the camera position. A platform at map x = 1000
+  // with the camera at x = 900 lands at canvas x = 100. Rounding to whole pixels keeps
+  // edges crisp instead of blurry while the camera glides.
+  ctx.save();
+  ctx.translate(-Math.round(camera.x), -Math.round(camera.y));
+
+  for (const p of map.platforms) {
+    ctx.fillStyle = p.type === "solid" ? "#6b4f3a" : "#3a7d44"; // brown solid blocks, green platforms
+    ctx.fillRect(p.x, p.y, p.width, p.height);
+  }
+
   for (const id in drawn) {
     const p = drawn[id];
     // Whoever is "it" is drawn in red. A frozen "it" is see-through until they can move.
@@ -282,10 +353,8 @@ function draw() {
     }
   }
 
-  drawRoundInfo();
-  drawPing();
-
-  requestAnimationFrame(draw); // ask the browser to call us again next frame
+  // Back to normal canvas coordinates, so the timer and ping stay fixed on screen.
+  ctx.restore();
 }
 
 // ===== Round info at the top of the screen: timer, waiting message, or winner =====

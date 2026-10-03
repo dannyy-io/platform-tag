@@ -5,10 +5,56 @@
 const FAKE_LAG_MS = 0;
 
 // ===== Physics =====
-// Gravity, movement and platforms live in public/physics.js, which the browser uses too.
+// Gravity, movement and collision live in public/physics.js, which the browser uses too.
 // That way the browser's predictions and the server's answers are always calculated the same way.
 const Physics = require("./public/physics.js");
-const { STEP_MS, PLAYER_SIZE, stepPlayer } = Physics;
+const { STEP_MS, PLAYER_SIZE, stepPlayer, overlaps } = Physics;
+
+// ===== Map =====
+// The level is a JSON file listing every platform. We load it once when the server starts,
+// and send it to each browser when they join (see "init" below).
+const fs = require("fs");
+const path = require("path");
+const MAP_FILE = path.join(__dirname, "maps", "map1.json");
+const map = loadMap(MAP_FILE);
+
+// Read a map file and check it makes sense, so a typo in the JSON gives a clear error
+// when the server starts instead of weird physics later.
+function loadMap(file) {
+  const m = JSON.parse(fs.readFileSync(file, "utf8"));
+  const isNumber = (n) => typeof n === "number" && Number.isFinite(n);
+  if (!isNumber(m.width) || !isNumber(m.height) || !Array.isArray(m.platforms)) {
+    throw new Error(file + ": a map needs a width, a height and a platforms list");
+  }
+  m.platforms.forEach((p, i) => {
+    if (![p.x, p.y, p.width, p.height].every(isNumber) || p.width <= 0 || p.height <= 0) {
+      throw new Error(file + ": platform " + i + " needs a number x, y, width and height (width and height above 0)");
+    }
+    if (p.type !== "solid" && p.type !== "platform") {
+      throw new Error(file + ": platform " + i + ' has type "' + p.type + '", it must be "solid" or "platform"');
+    }
+  });
+  console.log(`Loaded map "${m.name || file}" (${m.width}x${m.height}, ${m.platforms.length} platforms)`);
+  return m;
+}
+
+// A random place to stand: on top of a random platform, at a random spot along it.
+// We skip spots where the player would be stuck inside something solid (like the ceiling
+// above the walls) and try again.
+function randomSpawn() {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const p = map.platforms[Math.floor(Math.random() * map.platforms.length)];
+    if (p.width < PLAYER_SIZE) continue;
+    const spot = {
+      x: p.x + Math.random() * (p.width - PLAYER_SIZE),
+      y: p.y - PLAYER_SIZE,
+    };
+    const insideWorld = spot.x >= 0 && spot.y >= 0 && spot.x + PLAYER_SIZE <= map.width;
+    const stuck = map.platforms.some((other) => other.type === "solid" && overlaps(spot, other));
+    if (insideWorld && !stuck) return spot;
+  }
+  return { x: map.width / 2, y: 0 }; // couldn't find anywhere (strange map): drop in from the top middle
+}
 
 // ===== Tag rules =====
 const ROUND_LENGTH = 60 * 1000; // how long a round lasts (milliseconds)
@@ -191,10 +237,11 @@ function updateRound(now, elapsed) {
 
 // This runs once for every browser that connects.
 io.on("connection", (socket) => {
-  // 1. Add the new player, with no inputs yet
+  // 1. Add the new player somewhere random, with no inputs yet
+  const spawn = randomSpawn();
   players[socket.id] = {
     id: socket.id,
-    x: 50, y: 300,
+    x: spawn.x, y: spawn.y,
     vx: 0, vy: 0,
     onGround: false,
     color: randomColor(),
@@ -208,8 +255,9 @@ io.on("connection", (socket) => {
     inRound: false,  // true if they were here when the round started (only they can win)
   };
 
-  // 2. Tell the new player who they are. (The level is in physics.js, which they load too.)
-  withLag(() => socket.emit("init", { id: socket.id }));
+  // 2. Tell the new player who they are, and send the map so they can draw it
+  //    and run the same physics for prediction.
+  withLag(() => socket.emit("init", { id: socket.id, map }));
 
   // 3. The browser sends one numbered input for every physics step: { seq, left, right, jump }.
   //    We queue them up and the game loop runs them in order.
@@ -269,7 +317,7 @@ setInterval(() => {
     // Run waiting inputs in order, one physics step each, and remember the newest one we ran.
     while (p.inputQueue.length > 0 && p.stepCredit >= 1) {
       const input = p.inputQueue.shift();
-      stepPlayer(p, input);
+      stepPlayer(p, input, map);
       p.lastSeq = input.seq;
       p.stepCredit--;
     }
@@ -277,7 +325,7 @@ setInterval(() => {
     // Haven't heard from this browser in a while: keep them falling with no keys held.
     if (p.inputQueue.length === 0 && now - p.lastInputAt > IDLE_MS) {
       while (p.stepCredit >= 1) {
-        stepPlayer(p, NO_KEYS);
+        stepPlayer(p, NO_KEYS, map);
         p.stepCredit--;
       }
     }
