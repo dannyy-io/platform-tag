@@ -53,17 +53,35 @@ let round = { phase: "waiting", timeLeft: 0, winner: null };
 // ===== Prediction state =====
 // Every input we send gets the next number: 1, 2, 3, ...
 let inputSeq = 0;
-// Inputs we've sent that the server hasn't run yet, oldest first: [{ seq, left, right, jump }, ...]
+// Inputs we've sent that the server hasn't run yet, oldest first: [{ seq, tick, left, right, jump }, ...]
 let pendingInputs = [];
-// Where we think our own player is right now: { x, y, vx, vy, onGround, frozenSteps }.
+// Where we think our own player is right now: { x, y, vx, vy, onGround, standingOn, frozenSteps }.
 // null until the first update from the server (we need its starting point).
 let predicted = null;
 
-// When we join, the server tells us our id and sends the map.
+// ===== Ticks =====
+// Moving platforms are positioned by tick number (see platformPosition in physics.js).
+// The server counts ticks from the moment it started, and tells us when that was.
+let serverStartTime = null;
+// The tick our latest physics step ran on. It goes up by exactly 1 every step, so a platform
+// we're riding moves smoothly, and every input we send is labelled with it.
+let currentTick = null;
+// If our count drifts this many ticks away from the server's clock (e.g. the tab was hidden),
+// we jump straight to the right tick instead.
+const TICK_RESYNC = 10;
+
+// Which tick the server's clock is on, as far as we can tell.
+function estimatedServerTick() {
+  return Math.floor((Date.now() + serverTimeOffset - serverStartTime) / Physics.STEP_MS);
+}
+
+// When we join, the server tells us our id, sends the map, and says when it started.
 // (If we reconnect we get a new id and a new spawn spot, so start fresh.)
 socket.on("init", (data) => {
   myId = data.id;
   map = data.map;
+  serverStartTime = data.startTime;
+  currentTick = null;
   inputSeq = 0;
   pendingInputs = [];
   predicted = null;
@@ -121,12 +139,13 @@ function reconcile(me) {
   // 1. Go back to where the server says we were...
   predicted = {
     x: me.x, y: me.y,
-    vx: 0, vy: me.vy,
+    vx: me.vx, vy: me.vy,
     onGround: me.onGround,
+    standingOn: me.standingOn,
     frozenSteps: me.frozenSteps,
   };
-  // 2. ...then replay every input the server hasn't got to yet.
-  for (const input of pendingInputs) Physics.stepPlayer(predicted, input, map);
+  // 2. ...then replay every input the server hasn't got to yet, each on the same tick as before.
+  for (const input of pendingInputs) Physics.stepPlayer(predicted, input, map, input.tick);
 }
 
 // ===== Fixed time step =====
@@ -152,17 +171,22 @@ function runPhysicsSteps() {
 
 // One step: number the keys we're holding, send them, and apply them to our own player right away.
 function physicsStep() {
-  if (myId === null) return; // not joined yet
+  if (myId === null || serverTimeOffset === null) return; // not joined yet, or no clock yet
+
+  // Move on to the next tick, unless we've drifted from the server's clock.
+  const serverTick = estimatedServerTick();
+  if (currentTick === null || Math.abs(serverTick - currentTick) > TICK_RESYNC) currentTick = serverTick;
+  else currentTick++;
 
   inputSeq++;
-  const stepInput = { seq: inputSeq, left: input.left, right: input.right, jump: input.jump };
+  const stepInput = { seq: inputSeq, tick: currentTick, left: input.left, right: input.right, jump: input.jump };
   socket.emit("input", stepInput);
   pendingInputs.push(stepInput);
 
   // Normally the server answers long before this fills up. This just stops it growing forever.
   if (pendingInputs.length > 120) pendingInputs.shift();
 
-  if (predictionOn && predicted) Physics.stepPlayer(predicted, stepInput, map);
+  if (predictionOn && predicted) Physics.stepPlayer(predicted, stepInput, map, currentTick);
 }
 
 // Where every player should be drawn right now.
@@ -182,7 +206,12 @@ function playersToDraw() {
 
 // Everyone except us: drawn a little in the past, blended between server updates (interpolation).
 function otherPlayersToDraw() {
-  if (!interpolationOn || snapshots.length === 0) return { ...players };
+  if (!interpolationOn || snapshots.length === 0) {
+    const result = { ...players };
+    delete result[myId]; // ours is handled in playersToDraw
+    for (const id in result) rideAlong(result, id);
+    return result;
+  }
 
   const t = renderTime();
 
@@ -212,7 +241,28 @@ function otherPlayersToDraw() {
       y: a.y + (b.y - a.y) * amount,
     };
   }
+  for (const id in result) rideAlong(result, id);
   return result;
+}
+
+// Moving platforms are drawn at the current tick, but other players are drawn a little in the
+// past, so someone riding an elevator would look sunk into it or floating above it.
+// If the newest update says they're riding one, draw them on top of where it is now instead,
+// moved sideways by however far it has gone since the tick they were last at.
+function rideAlong(result, id) {
+  const newest = players[id];
+  if (!newest || !newest.onGround || !map) return;
+  const platform = map.platforms[newest.standingOn];
+  if (!platform || platform.type !== "moving") return;
+  const now = Physics.platformPosition(platform, drawTick());
+  const then = Physics.platformPosition(platform, newest.tick);
+  result[id] = { ...result[id], x: newest.x + (now.x - then.x), y: now.y - playerSize };
+}
+
+// The tick moving platforms are drawn at: the one our own player was last moved on,
+// so when we ride one we're drawn exactly on top of it.
+function drawTick() {
+  return currentTick !== null ? currentTick : estimatedServerTick();
 }
 
 // ===== Ping =====
@@ -312,6 +362,63 @@ function draw() {
   requestAnimationFrame(draw); // ask the browser to call us again next frame
 }
 
+// ===== Platforms: each type has its own look =====
+function drawPlatform(p, tick) {
+  const { x, y } = Physics.platformPosition(p, tick);
+  const w = p.width, h = p.height;
+
+  if (p.type === "solid") {
+    ctx.fillStyle = "#6b4f3a"; // brown block
+    ctx.fillRect(x, y, w, h);
+  } else if (p.type === "ice") {
+    ctx.fillStyle = "#bfeaf5"; // pale blue
+    ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = "#ffffff"; // shiny white top edge
+    ctx.fillRect(x, y, w, 3);
+    ctx.strokeStyle = "#ffffff"; // a few diagonal glints
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let gx = x + 20; gx + 10 < x + w; gx += 60) {
+      ctx.moveTo(gx, y + h - 3);
+      ctx.lineTo(gx + 10, y + 5);
+    }
+    ctx.stroke();
+  } else if (p.type === "jumppad") {
+    ctx.fillStyle = "#f28c28"; // orange
+    ctx.fillRect(x, y, w, h);
+    // Upward arrows above it, bobbing up and down so it catches the eye
+    const bob = Math.sin(performance.now() / 150) * 3;
+    ctx.fillStyle = "#f2c12e";
+    for (let ax = x + 15; ax <= x + w - 15; ax += 30) {
+      ctx.beginPath();
+      ctx.moveTo(ax - 8, y - 6 + bob);
+      ctx.lineTo(ax, y - 16 + bob);
+      ctx.lineTo(ax + 8, y - 6 + bob);
+      ctx.fill();
+    }
+  } else if (p.type === "moving") {
+    ctx.fillStyle = "#7d4fc4"; // purple
+    ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = "#b796ea"; // lighter stripe on top
+    ctx.fillRect(x, y, w, 4);
+  } else {
+    ctx.fillStyle = "#3a7d44"; // plain green platform
+    ctx.fillRect(x, y, w, h);
+  }
+}
+
+// A faint dashed line showing the track a moving platform goes back and forth along.
+function drawTrack(p) {
+  ctx.strokeStyle = "rgba(90, 50, 140, 0.35)";
+  ctx.lineWidth = 2;
+  ctx.setLineDash([6, 6]);
+  ctx.beginPath();
+  ctx.moveTo(p.x + p.width / 2, p.y + p.height / 2);
+  ctx.lineTo(p.toX + p.width / 2, p.toY + p.height / 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
 // Everything that lives on the map (platforms and players), drawn through the camera.
 function drawWorld(dt) {
   const drawn = playersToDraw();
@@ -324,10 +431,9 @@ function drawWorld(dt) {
   ctx.save();
   ctx.translate(-Math.round(camera.x), -Math.round(camera.y));
 
-  for (const p of map.platforms) {
-    ctx.fillStyle = p.type === "solid" ? "#6b4f3a" : "#3a7d44"; // brown solid blocks, green platforms
-    ctx.fillRect(p.x, p.y, p.width, p.height);
-  }
+  const tick = drawTick();
+  for (const p of map.platforms) if (p.type === "moving") drawTrack(p); // tracks go behind everything
+  for (const p of map.platforms) drawPlatform(p, tick);
 
   for (const id in drawn) {
     const p = drawn[id];

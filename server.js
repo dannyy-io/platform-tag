@@ -2,7 +2,7 @@
 // Pretend the network is slow. Every message the server receives, and every message
 // it sends, waits this many milliseconds first. 0 means no fake lag.
 // Try 100 or 200 to feel what a laggy connection is like.
-const FAKE_LAG_MS = 0;
+const FAKE_LAG_MS = 75;
 
 // ===== Physics =====
 // Gravity, movement and collision live in public/physics.js, which the browser uses too.
@@ -16,7 +16,25 @@ const { STEP_MS, PLAYER_SIZE, stepPlayer, overlaps } = Physics;
 const fs = require("fs");
 const path = require("path");
 const MAP_FILE = path.join(__dirname, "maps", "map1.json");
+const MAP_TYPES = ["solid", "platform", "ice", "jumppad", "moving"];
 const map = loadMap(MAP_FILE);
+
+// ===== Ticks =====
+// Moving platforms are positioned by tick number: physics steps (60 per second) counted
+// since the server started. The browser is told START_TIME so it can count along.
+const START_TIME = Date.now();
+function currentTick() {
+  return Math.floor((Date.now() - START_TIME) / STEP_MS);
+}
+// Each input says which tick the browser ran it on, and we run it on that same tick so moving
+// platforms are where the browser thought they were. Inputs arrive a little late, so that tick
+// is a little in the past. We only accept ticks within this window, so nobody can pick
+// wherever they like for the platforms.
+const MAX_TICKS_BEHIND = 120; // 2 seconds
+const MAX_TICKS_AHEAD = 10;
+function allowedTick(tick, nowTick) {
+  return Math.max(nowTick - MAX_TICKS_BEHIND, Math.min(nowTick + MAX_TICKS_AHEAD, tick));
+}
 
 // Read a map file and check it makes sense, so a typo in the JSON gives a clear error
 // when the server starts instead of weird physics later.
@@ -30,8 +48,11 @@ function loadMap(file) {
     if (![p.x, p.y, p.width, p.height].every(isNumber) || p.width <= 0 || p.height <= 0) {
       throw new Error(file + ": platform " + i + " needs a number x, y, width and height (width and height above 0)");
     }
-    if (p.type !== "solid" && p.type !== "platform") {
-      throw new Error(file + ": platform " + i + ' has type "' + p.type + '", it must be "solid" or "platform"');
+    if (!MAP_TYPES.includes(p.type)) {
+      throw new Error(file + ": platform " + i + ' has type "' + p.type + '", it must be one of: ' + MAP_TYPES.join(", "));
+    }
+    if (p.type === "moving" && (![p.toX, p.toY, p.seconds].every(isNumber) || p.seconds <= 0)) {
+      throw new Error(file + ": moving platform " + i + " needs a number toX, toY and seconds (seconds above 0)");
     }
   });
   console.log(`Loaded map "${m.name || file}" (${m.width}x${m.height}, ${m.platforms.length} platforms)`);
@@ -45,13 +66,16 @@ function randomSpawn() {
   for (let attempt = 0; attempt < 100; attempt++) {
     const p = map.platforms[Math.floor(Math.random() * map.platforms.length)];
     if (p.width < PLAYER_SIZE) continue;
+    if (p.type === "moving" || p.type === "jumppad") continue; // no spawning onto something that moves or launches you
     const spot = {
       x: p.x + Math.random() * (p.width - PLAYER_SIZE),
       y: p.y - PLAYER_SIZE,
     };
     const insideWorld = spot.x >= 0 && spot.y >= 0 && spot.x + PLAYER_SIZE <= map.width;
     const stuck = map.platforms.some((other) => other.type === "solid" && overlaps(spot, other));
-    if (insideWorld && !stuck) return spot;
+    // A jump pad sitting on this platform right under our feet would launch us the moment we join.
+    const onPad = map.platforms.some((other) => other.type === "jumppad" && overlaps({ x: spot.x, y: spot.y + 1 }, other));
+    if (insideWorld && !stuck && !onPad) return spot;
   }
   return { x: map.width / 2, y: 0 }; // couldn't find anywhere (strange map): drop in from the top middle
 }
@@ -244,6 +268,8 @@ io.on("connection", (socket) => {
     x: spawn.x, y: spawn.y,
     vx: 0, vy: 0,
     onGround: false,
+    standingOn: -1,          // index in map.platforms of what they're standing on (-1 = nothing)
+    tick: currentTick(),     // the tick their last physics step ran on
     color: randomColor(),
     inputQueue: [],          // inputs received but not run yet, oldest first
     lastQueuedSeq: 0,        // number of the newest input put in the queue
@@ -256,10 +282,10 @@ io.on("connection", (socket) => {
   };
 
   // 2. Tell the new player who they are, and send the map so they can draw it
-  //    and run the same physics for prediction.
-  withLag(() => socket.emit("init", { id: socket.id, map }));
+  //    and run the same physics for prediction. startTime lets them count ticks like we do.
+  withLag(() => socket.emit("init", { id: socket.id, map, startTime: START_TIME }));
 
-  // 3. The browser sends one numbered input for every physics step: { seq, left, right, jump }.
+  // 3. The browser sends one numbered input for every physics step: { seq, tick, left, right, jump }.
   //    We queue them up and the game loop runs them in order.
   //    We only trust true/false values — anything else counts as "not held".
   //    The number must be a whole number bigger than the last one, or we ignore the input.
@@ -273,6 +299,7 @@ io.on("connection", (socket) => {
     p.lastQueuedSeq = input.seq;
     p.inputQueue.push({
       seq: input.seq,
+      tick: Number.isSafeInteger(input.tick) ? input.tick : null, // null = "use the current tick"
       left: input.left === true,
       right: input.right === true,
       jump: input.jump === true,
@@ -315,9 +342,12 @@ setInterval(() => {
     p.stepCredit = Math.min(p.stepCredit + elapsed / STEP_MS, MAX_STEP_CREDIT);
 
     // Run waiting inputs in order, one physics step each, and remember the newest one we ran.
+    // Each runs on the tick the browser ran it on (if that's within the allowed window).
+    const nowTick = currentTick();
     while (p.inputQueue.length > 0 && p.stepCredit >= 1) {
       const input = p.inputQueue.shift();
-      stepPlayer(p, input, map);
+      p.tick = allowedTick(input.tick === null ? nowTick : input.tick, nowTick);
+      stepPlayer(p, input, map, p.tick);
       p.lastSeq = input.seq;
       p.stepCredit--;
     }
@@ -325,7 +355,8 @@ setInterval(() => {
     // Haven't heard from this browser in a while: keep them falling with no keys held.
     if (p.inputQueue.length === 0 && now - p.lastInputAt > IDLE_MS) {
       while (p.stepCredit >= 1) {
-        stepPlayer(p, NO_KEYS, map);
+        p.tick = allowedTick(p.tick + 1, nowTick);
+        stepPlayer(p, NO_KEYS, map, p.tick);
         p.stepCredit--;
       }
     }
@@ -334,7 +365,7 @@ setInterval(() => {
   updateRound(now, elapsed);
 
   // Send what browsers need to draw, plus what your own browser needs to redo its
-  // prediction: vy, onGround, frozenSteps, and the number of the last input we ran.
+  // prediction: vx, vy, onGround, standingOn, frozenSteps, and the number of the last input we ran.
   const state = {
     time: now, // when this update happened (server's clock), so browsers can line updates up in time
     players: {},
@@ -350,7 +381,8 @@ setInterval(() => {
       x: p.x, y: p.y, color: p.color,
       it: id === round.itId,
       frozen: isFrozen(p),
-      vy: p.vy, onGround: p.onGround, frozenSteps: p.frozenSteps,
+      vx: p.vx, vy: p.vy, onGround: p.onGround, standingOn: p.standingOn, frozenSteps: p.frozenSteps,
+      tick: p.tick, // so browsers can draw riders on a moving platform where it is right now
       lastSeq: p.lastSeq,
     };
   }
