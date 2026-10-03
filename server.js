@@ -2,7 +2,7 @@
 // Pretend the network is slow. Every message the server receives, and every message
 // it sends, waits this many milliseconds first. 0 means no fake lag.
 // Try 100 or 200 to feel what a laggy connection is like.
-const FAKE_LAG_MS = 75;
+const FAKE_LAG_MS = 0;
 
 // ===== Physics =====
 // Gravity, movement and platforms live in public/physics.js, which the browser uses too.
