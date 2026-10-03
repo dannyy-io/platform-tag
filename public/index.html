@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Simple Platformer</title>
+    <style>
+      /* Center the canvas on a dark background */
+      body { margin: 0; background: #222; display: flex; justify-content: center; align-items: center; height: 100vh; }
+      canvas { background: #87ceeb; } /* sky blue */
+    </style>
+  </head>
+  <body>
+    <!-- The canvas is the "drawing board" our game paints onto every frame -->
+    <canvas id="game" width="800" height="450"></canvas>
+
+    <!-- Load the game code after the canvas exists -->
+    <script src="game.js"></script>
+  </body>
+</html>
