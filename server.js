@@ -1,3 +1,9 @@
+// ===== Testing: fake lag =====
+// Pretend the network is slow. Every message the server receives, and every message
+// it sends, waits this many milliseconds first. 0 means no fake lag.
+// Try 100 or 200 to feel what a laggy connection is like.
+const FAKE_LAG_MS = 75;
+
 // ===== Tweakable constants (try changing these!) =====
 const GRAVITY = 0.5;        // how much downward speed is added every physics step
 const JUMP_STRENGTH = 11;   // upward speed given when you jump
@@ -35,6 +41,13 @@ app.use(express.static("public"));
 // Socket.IO needs the raw HTTP server that Express runs on, so we create it ourselves.
 const server = http.createServer(app);
 const io = new Server(server);
+
+// Run fn after FAKE_LAG_MS, or right away if there's no fake lag.
+// Every message going in or out of the server goes through this.
+function withLag(fn) {
+  if (FAKE_LAG_MS > 0) setTimeout(fn, FAKE_LAG_MS);
+  else fn();
+}
 
 // Platforms are just rectangles. The first one is the floor.
 // They live on the server now, and each player is sent a copy when they join.
@@ -227,19 +240,27 @@ io.on("connection", (socket) => {
   };
 
   // 2. Tell the new player who they are and what the level looks like
-  socket.emit("init", { id: socket.id, platforms, playerSize: PLAYER_SIZE });
+  withLag(() => socket.emit("init", { id: socket.id, platforms, playerSize: PLAYER_SIZE }));
 
   // 3. Whenever this player presses or releases a key, remember it.
   //    We only trust true/false values — anything else counts as "not held".
-  socket.on("input", (input) => {
+  //    (With fake lag they might have left by the time this runs — the !p check covers that.)
+  socket.on("input", (input) => withLag(() => {
     const p = players[socket.id];
     if (!p || typeof input !== "object" || input === null) return;
     p.input.left  = input.left === true;
     p.input.right = input.right === true;
     p.input.jump  = input.jump === true;
-  });
+  }));
 
-  // 4. When they close the tab, remove them. The next tick's state won't include them.
+  // 4. Ping: the browser sends the time it sent the ping, and we send that same number straight back.
+  //    The browser subtracts it from the time the reply arrives to get the round trip.
+  //    With fake lag, the ping waits once on the way in and once on the way out.
+  socket.on("ping-check", (sentAt) => withLag(() => {
+    withLag(() => socket.emit("pong-check", sentAt));
+  }));
+
+  // 5. When they close the tab, remove them. The next tick's state won't include them.
   socket.on("disconnect", () => {
     delete players[socket.id];
     // If "it" left mid-round, pick someone else to be "it".
@@ -281,7 +302,7 @@ setInterval(() => {
       frozen: isFrozen(p, now),
     };
   }
-  io.emit("state", state);
+  withLag(() => io.emit("state", state));
 }, 1000 / TICK_RATE);
 
 // "0.0.0.0" means "accept connections from any network", not just this computer.

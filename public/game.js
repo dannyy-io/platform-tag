@@ -37,6 +37,19 @@ socket.on("state", (state) => {
   round = state.round;
 });
 
+// ===== Ping =====
+// Every second, send the server the current time. It sends the same number back,
+// so (now - that number) is how long the round trip took.
+let pingMs = null; // null until the first reply arrives
+
+setInterval(() => {
+  socket.emit("ping-check", Date.now());
+}, 1000);
+
+socket.on("pong-check", (sentAt) => {
+  pingMs = Date.now() - sentAt;
+});
+
 // ===== Keyboard input =====
 // Which of our three actions are being held right now.
 const input = { left: false, right: false, jump: false };
@@ -98,6 +111,7 @@ function draw() {
   }
 
   drawRoundInfo();
+  drawPing();
 
   requestAnimationFrame(draw); // ask the browser to call us again next frame
 }
@@ -129,6 +143,14 @@ function drawRoundInfo() {
     ctx.font = "14px sans-serif";
     ctx.fillText("(only " + itSeconds + "s as IT) - next round soon", centerX, 54);
   }
+}
+
+// ===== Ping in the top-left corner =====
+function drawPing() {
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#000";
+  ctx.font = "12px sans-serif";
+  ctx.fillText("ping: " + (pingMs === null ? "--" : pingMs) + " ms", 8, 18);
 }
 
 draw(); // start drawing!
