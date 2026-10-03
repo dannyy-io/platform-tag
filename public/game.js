@@ -16,8 +16,12 @@ let platforms = [];
 let playerSize = 30;
 
 // Every player's position and color, from the server's latest update:
-// { "abc123": { x, y, color }, ... }
+// { "abc123": { x, y, color, it, frozen }, ... }
 let players = {};
+
+// What the tag round is doing, from the server's latest update:
+// { phase: "waiting" | "playing" | "results", timeLeft, winner: { id, color, itTime } | null }
+let round = { phase: "waiting", timeLeft: 0, winner: null };
 
 // When we join, the server tells us our id and what the level looks like.
 socket.on("init", (data) => {
@@ -26,8 +30,12 @@ socket.on("init", (data) => {
   playerSize = data.playerSize;
 });
 
-// 30 times per second, the server sends where everyone is. We just keep the newest copy.
-socket.on("state", (state) => { players = state; });
+// 30 times per second, the server sends where everyone is and how the round is going.
+// We just keep the newest copy. (All the tag rules run on the server.)
+socket.on("state", (state) => {
+  players = state.players;
+  round = state.round;
+});
 
 // ===== Keyboard input =====
 // Which of our three actions are being held right now.
@@ -67,19 +75,60 @@ function draw() {
 
   for (const id in players) {
     const p = players[id];
-    ctx.fillStyle = p.color;
+    // Whoever is "it" is drawn in red. A frozen "it" is see-through until they can move.
+    ctx.globalAlpha = p.frozen ? 0.5 : 1;
+    ctx.fillStyle = p.it ? "red" : p.color;
     ctx.fillRect(p.x, p.y, playerSize, playerSize);
+    ctx.globalAlpha = 1;
 
-    // Put a "you" label above our own square
+    // Labels stack upward above the square: "you" first, then "IT" above that.
+    ctx.textAlign = "center";
+    let labelY = p.y - 6;
     if (id === myId) {
       ctx.fillStyle = "#000";
       ctx.font = "12px sans-serif";
-      ctx.textAlign = "center";
-      ctx.fillText("you", p.x + playerSize / 2, p.y - 6);
+      ctx.fillText("you", p.x + playerSize / 2, labelY);
+      labelY -= 14;
+    }
+    if (p.it) {
+      ctx.fillStyle = "red";
+      ctx.font = "bold 14px sans-serif";
+      ctx.fillText("IT", p.x + playerSize / 2, labelY);
     }
   }
 
+  drawRoundInfo();
+
   requestAnimationFrame(draw); // ask the browser to call us again next frame
+}
+
+// ===== Round info at the top of the screen: timer, waiting message, or winner =====
+function drawRoundInfo() {
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#000";
+  ctx.font = "bold 20px sans-serif";
+  const centerX = canvas.width / 2;
+
+  if (round.phase === "waiting") {
+    ctx.fillText("Waiting for another player...", centerX, 30);
+  } else if (round.phase === "playing") {
+    // Show time left as m:ss, e.g. 0:42
+    const seconds = Math.ceil(round.timeLeft / 1000);
+    const m = Math.floor(seconds / 60);
+    const s = String(seconds % 60).padStart(2, "0");
+    ctx.fillText(m + ":" + s, centerX, 30);
+  } else if (round.phase === "results" && round.winner) {
+    const w = round.winner;
+    const itSeconds = (w.itTime / 1000).toFixed(1);
+    const text = w.id === myId ? "You win!" : "Winner:";
+    ctx.fillText(text, centerX - 20, 30);
+    // A square in the winner's color, since players don't have names
+    ctx.fillStyle = w.color;
+    ctx.fillRect(centerX + ctx.measureText(text).width / 2 - 8, 12, 22, 22);
+    ctx.fillStyle = "#000";
+    ctx.font = "14px sans-serif";
+    ctx.fillText("(only " + itSeconds + "s as IT) - next round soon", centerX, 54);
+  }
 }
 
 draw(); // start drawing!
