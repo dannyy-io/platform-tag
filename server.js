@@ -4,25 +4,37 @@
 // Try 100 or 200 to feel what a laggy connection is like.
 const FAKE_LAG_MS = 75;
 
-// ===== Tweakable constants (try changing these!) =====
-const GRAVITY = 0.5;        // how much downward speed is added every physics step
-const JUMP_STRENGTH = 11;   // upward speed given when you jump
-const MOVE_SPEED = 4;       // pixels moved left/right per physics step
+// ===== Physics =====
+// Gravity, movement and platforms live in public/physics.js, which the browser uses too.
+// That way the browser's predictions and the server's answers are always calculated the same way.
+const Physics = require("./public/physics.js");
+const { STEP_MS, PLAYER_SIZE, stepPlayer } = Physics;
 
 // ===== Tag rules =====
 const ROUND_LENGTH = 60 * 1000; // how long a round lasts (milliseconds)
 const FREEZE_TIME = 1.5 * 1000; // how long a newly tagged "it" can't move or tag (milliseconds)
+// The freeze is counted in that player's physics steps (90 steps = 1.5 seconds),
+// so the browser can predict exactly which of its inputs will be frozen.
+const FREEZE_STEPS = Math.round(FREEZE_TIME / STEP_MS);
 const RESULTS_TIME = 5 * 1000;  // how long the winner is shown before the next round (milliseconds)
 const MIN_PLAYERS = 2;          // a round only runs with at least this many players
 
 // How often the server updates the world and tells everyone about it.
+// (This is only a target: on Windows, Node's timers are rough and it's really about 21
+// per second. That's fine, because how far physics moves depends on the real time that
+// passed, not on how many ticks happened. See the game loop.)
 const TICK_RATE = 30; // ticks per second
-// The constants above were tuned for 60 steps per second, so each tick runs
-// the physics twice. That keeps the game feeling exactly the same as before.
-const STEPS_PER_TICK = 2;
 
-const WORLD_WIDTH = 800;  // must match the canvas width in index.html
-const PLAYER_SIZE = 30;
+// ===== Input queue =====
+// Every input the browser sends is one physics step. They wait in a queue and the
+// server runs them in order. These limits stop a cheater from sending inputs faster
+// than 60 per second to move faster than everyone else.
+const MAX_STEP_CREDIT = 8;     // at most this many queued inputs can be caught up on in one tick
+const MAX_QUEUED_INPUTS = 30;  // inputs beyond this (half a second's worth) are thrown away
+// If a browser stops sending inputs (e.g. its tab is in the background), the server
+// keeps moving that player with no keys held, so they don't hang in mid-air.
+const IDLE_MS = 500;
+const NO_KEYS = { left: false, right: false, jump: false };
 
 // A tiny web server. It sends the files in "public" to the browser,
 // runs the game itself, and sends the results to every browser using Socket.IO.
@@ -49,18 +61,8 @@ function withLag(fn) {
   else fn();
 }
 
-// Platforms are just rectangles. The first one is the floor.
-// They live on the server now, and each player is sent a copy when they join.
-const platforms = [
-  { x: 0,   y: 420, width: 800, height: 30 },
-  { x: 150, y: 340, width: 120, height: 15 },
-  { x: 330, y: 270, width: 120, height: 15 },
-  { x: 520, y: 200, width: 120, height: 15 },
-  { x: 340, y: 130, width: 100, height: 15 },
-];
-
 // Everyone currently connected, keyed by their socket id.
-// Each player has a position (x, y), a velocity (vx, vy), and the keys they're holding.
+// Each player has a position (x, y), a velocity (vx, vy), and a queue of inputs waiting to run.
 const players = {};
 
 // Red is saved for "it", so normal players get any hue except the reds (roughly 0-30 and 330-360).
@@ -93,7 +95,7 @@ function startRound() {
   // Everyone starts the round with a clean slate.
   for (const id in players) {
     players[id].itTime = 0;
-    players[id].frozenUntil = 0;
+    players[id].frozenSteps = 0;
     players[id].inRound = true;
   }
   round.phase = "playing";
@@ -130,11 +132,11 @@ function stopRound() {
 
 // Between rounds nobody is "it", so nobody should stay frozen.
 function unfreezeEveryone() {
-  for (const id in players) players[id].frozenUntil = 0;
+  for (const id in players) players[id].frozenSteps = 0;
 }
 
-function isFrozen(player, now) {
-  return now < player.frozenUntil;
+function isFrozen(player) {
+  return player.frozenSteps > 0;
 }
 
 // Do two players' squares overlap?
@@ -175,82 +177,58 @@ function updateRound(now, elapsed) {
   it.itTime += elapsed;
 
   // A frozen "it" can't tag anyone, so whoever just tagged them gets a head start.
-  if (isFrozen(it, now)) return;
+  if (isFrozen(it)) return;
 
   for (const id in players) {
     if (id === it.id) continue;
     if (touching(it, players[id])) {
       round.itId = id;
-      players[id].frozenUntil = now + FREEZE_TIME;
+      players[id].frozenSteps = FREEZE_STEPS;
       break; // only one tag per tick
-    }
-  }
-}
-
-// ===== Physics: move one player one step, using the keys they're holding =====
-function stepPlayer(player, frozen) {
-  // 1. Left/right movement based on held keys (a frozen player's keys do nothing)
-  player.vx = 0;
-  if (!frozen && player.input.left)  player.vx = -MOVE_SPEED;
-  if (!frozen && player.input.right) player.vx = MOVE_SPEED;
-
-  // 2. Jump, but only if standing on something
-  if (!frozen && player.input.jump && player.onGround) {
-    player.vy = -JUMP_STRENGTH; // negative y means "up" on a canvas
-  }
-
-  // 3. Gravity: always pull downward a little more each step
-  player.vy += GRAVITY;
-
-  // 4. Move horizontally, keeping the player inside the world
-  player.x += player.vx;
-  player.x = Math.max(0, Math.min(WORLD_WIDTH - PLAYER_SIZE, player.x));
-
-  // 5. Move vertically, then check for landing on platforms
-  const previousBottom = player.y + PLAYER_SIZE; // where their feet were before moving
-  player.y += player.vy;
-  player.onGround = false;
-
-  for (const p of platforms) {
-    const overlapsHorizontally = player.x + PLAYER_SIZE > p.x && player.x < p.x + p.width;
-    const feetNow = player.y + PLAYER_SIZE;
-    // Land only if falling AND their feet were above the platform top last step
-    // but are at or below it now (they "crossed" the top edge this step).
-    if (overlapsHorizontally && player.vy >= 0 && previousBottom <= p.y && feetNow >= p.y) {
-      player.y = p.y - PLAYER_SIZE; // snap feet onto the platform
-      player.vy = 0;                // stop falling
-      player.onGround = true;
     }
   }
 }
 
 // This runs once for every browser that connects.
 io.on("connection", (socket) => {
-  // 1. Add the new player, holding no keys
+  // 1. Add the new player, with no inputs yet
   players[socket.id] = {
     id: socket.id,
     x: 50, y: 300,
     vx: 0, vy: 0,
     onGround: false,
     color: randomColor(),
-    input: { left: false, right: false, jump: false },
+    inputQueue: [],          // inputs received but not run yet, oldest first
+    lastQueuedSeq: 0,        // number of the newest input put in the queue
+    lastSeq: 0,              // number of the newest input actually run (sent back to the browser)
+    stepCredit: 0,           // how many queued inputs we're allowed to run right now
+    lastInputAt: Date.now(), // when we last heard from this browser
     itTime: 0,       // milliseconds spent as "it" this round
-    frozenUntil: 0,  // can't move or tag until this Date.now() time
+    frozenSteps: 0,  // can't move or tag for this many more of their physics steps
     inRound: false,  // true if they were here when the round started (only they can win)
   };
 
-  // 2. Tell the new player who they are and what the level looks like
-  withLag(() => socket.emit("init", { id: socket.id, platforms, playerSize: PLAYER_SIZE }));
+  // 2. Tell the new player who they are. (The level is in physics.js, which they load too.)
+  withLag(() => socket.emit("init", { id: socket.id }));
 
-  // 3. Whenever this player presses or releases a key, remember it.
+  // 3. The browser sends one numbered input for every physics step: { seq, left, right, jump }.
+  //    We queue them up and the game loop runs them in order.
   //    We only trust true/false values — anything else counts as "not held".
+  //    The number must be a whole number bigger than the last one, or we ignore the input.
   //    (With fake lag they might have left by the time this runs — the !p check covers that.)
   socket.on("input", (input) => withLag(() => {
     const p = players[socket.id];
     if (!p || typeof input !== "object" || input === null) return;
-    p.input.left  = input.left === true;
-    p.input.right = input.right === true;
-    p.input.jump  = input.jump === true;
+    if (!Number.isSafeInteger(input.seq) || input.seq <= p.lastQueuedSeq) return;
+    p.lastInputAt = Date.now();
+    if (p.inputQueue.length >= MAX_QUEUED_INPUTS) return; // far too many waiting: drop it
+    p.lastQueuedSeq = input.seq;
+    p.inputQueue.push({
+      seq: input.seq,
+      left: input.left === true,
+      right: input.right === true,
+      jump: input.jump === true,
+    });
   }));
 
   // 4. Ping: the browser sends the time it sent the ping, and we send that same number straight back.
@@ -271,7 +249,7 @@ io.on("connection", (socket) => {
   });
 });
 
-// ===== Game loop: 30 times per second, move everyone, apply the tag rules, then tell everyone =====
+// ===== Game loop: 30 times per second, run everyone's inputs, apply the tag rules, then tell everyone =====
 let lastTick = Date.now();
 setInterval(() => {
   const now = Date.now();
@@ -279,13 +257,36 @@ setInterval(() => {
   lastTick = now;
 
   for (const id in players) {
-    const frozen = isFrozen(players[id], now);
-    for (let i = 0; i < STEPS_PER_TICK; i++) stepPlayer(players[id], frozen);
+    const p = players[id];
+
+    // Earn one step of credit for every STEP_MS of real time that passed (60 per second,
+    // exactly the rate the browser sends inputs). Counting real time matters: ticks don't
+    // arrive on schedule, so a fixed amount per tick would fall behind the browser.
+    // Saving a few up lets us catch up when several inputs arrive at once (networks
+    // are bumpy), but only up to MAX_STEP_CREDIT.
+    p.stepCredit = Math.min(p.stepCredit + elapsed / STEP_MS, MAX_STEP_CREDIT);
+
+    // Run waiting inputs in order, one physics step each, and remember the newest one we ran.
+    while (p.inputQueue.length > 0 && p.stepCredit >= 1) {
+      const input = p.inputQueue.shift();
+      stepPlayer(p, input);
+      p.lastSeq = input.seq;
+      p.stepCredit--;
+    }
+
+    // Haven't heard from this browser in a while: keep them falling with no keys held.
+    if (p.inputQueue.length === 0 && now - p.lastInputAt > IDLE_MS) {
+      while (p.stepCredit >= 1) {
+        stepPlayer(p, NO_KEYS);
+        p.stepCredit--;
+      }
+    }
   }
 
   updateRound(now, elapsed);
 
-  // Send only what browsers need to draw (not velocities, inputs, or timers).
+  // Send what browsers need to draw, plus what your own browser needs to redo its
+  // prediction: vy, onGround, frozenSteps, and the number of the last input we ran.
   const state = {
     time: now, // when this update happened (server's clock), so browsers can line updates up in time
     players: {},
@@ -300,7 +301,9 @@ setInterval(() => {
     state.players[id] = {
       x: p.x, y: p.y, color: p.color,
       it: id === round.itId,
-      frozen: isFrozen(p, now),
+      frozen: isFrozen(p),
+      vy: p.vy, onGround: p.onGround, frozenSteps: p.frozenSteps,
+      lastSeq: p.lastSeq,
     };
   }
   withLag(() => io.emit("state", state));

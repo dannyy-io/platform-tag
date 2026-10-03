@@ -1,6 +1,7 @@
-// The browser's only jobs now: tell the server which keys are held,
-// and draw whatever the server says the world looks like.
-// All the physics (gravity, jumping, platforms) happens on the server.
+// The browser's jobs: send the server a numbered input every physics step, guess ("predict")
+// where our own player is going using the same physics as the server (physics.js),
+// fix that guess whenever the server answers, and draw everything.
+// The server is still the boss: it decides where everyone really is, and runs the tag rules.
 
 // ===== Interpolation =====
 // Other players are drawn this many milliseconds in the past, smoothly blended
@@ -10,6 +11,11 @@ const INTERP_DELAY_MS = 100;
 
 // Press I to switch interpolation on and off, to compare.
 let interpolationOn = true;
+
+// ===== Prediction =====
+// Our own player moves the moment we press a key, instead of waiting for the server.
+// Press P to switch prediction on and off, to compare.
+let predictionOn = true;
 
 // ===== Setup =====
 const canvas = document.getElementById("game");
@@ -21,8 +27,10 @@ const socket = io();
 
 // Filled in by the server when we join.
 let myId = null;
-let platforms = [];
-let playerSize = 30;
+
+// The level and player size come from physics.js, the same file the server uses.
+const platforms = Physics.PLATFORMS;
+const playerSize = Physics.PLAYER_SIZE;
 
 // Every player's position and color, from the server's latest update:
 // { "abc123": { x, y, color, it, frozen }, ... }
@@ -32,11 +40,21 @@ let players = {};
 // { phase: "waiting" | "playing" | "results", timeLeft, winner: { id, color, itTime } | null }
 let round = { phase: "waiting", timeLeft: 0, winner: null };
 
-// When we join, the server tells us our id and what the level looks like.
+// ===== Prediction state =====
+// Every input we send gets the next number: 1, 2, 3, ...
+let inputSeq = 0;
+// Inputs we've sent that the server hasn't run yet, oldest first: [{ seq, left, right, jump }, ...]
+let pendingInputs = [];
+// Where we think our own player is right now: { x, y, vx, vy, onGround, frozenSteps }.
+// null until the first update from the server (we need its starting point).
+let predicted = null;
+
+// When we join, the server tells us our id. (If we reconnect we get a new id, so start fresh.)
 socket.on("init", (data) => {
   myId = data.id;
-  platforms = data.platforms;
-  playerSize = data.playerSize;
+  inputSeq = 0;
+  pendingInputs = [];
+  predicted = null;
 });
 
 // Recent updates from the server, oldest first: [{ time, players }, ...]
@@ -71,11 +89,87 @@ socket.on("state", (state) => {
   // Throw away updates we'll never need again. We keep exactly one update
   // older than the render time, since we blend from it toward the next one.
   while (snapshots.length > 2 && snapshots[1].time <= renderTime()) snapshots.shift();
+
+  reconcile(state.players[myId]);
 });
+
+// ===== Reconciliation: fix our guess using the server's answer =====
+// The server's position for us is a little old: it only includes inputs up to number "lastSeq".
+// So we start from the server's position and quickly redo every input it hasn't run yet.
+// If our guesses were right, we end up exactly where we already were, so nothing visibly changes.
+function reconcile(me) {
+  if (!me) return;
+
+  // The server has run these already, so we never need them again.
+  pendingInputs = pendingInputs.filter((input) => input.seq > me.lastSeq);
+
+  if (!predictionOn) return;
+
+  // 1. Go back to where the server says we were...
+  predicted = {
+    x: me.x, y: me.y,
+    vx: 0, vy: me.vy,
+    onGround: me.onGround,
+    frozenSteps: me.frozenSteps,
+  };
+  // 2. ...then replay every input the server hasn't got to yet.
+  for (const input of pendingInputs) Physics.stepPlayer(predicted, input);
+}
+
+// ===== Fixed time step =====
+// Physics runs in steps of exactly Physics.STEP_MS (60 per second), the same as the server,
+// no matter how fast this screen redraws. We save up real time and spend it one step at a time.
+let lastFrameTime = performance.now();
+let unspentTime = 0;
+
+function runPhysicsSteps() {
+  const now = performance.now();
+  unspentTime += now - lastFrameTime;
+  lastFrameTime = now;
+
+  // If the tab was hidden for a while, don't try to catch up hundreds of steps at once.
+  // (The server kept us moving meanwhile; the next update will put us in the right place.)
+  if (unspentTime > 250) unspentTime = Physics.STEP_MS;
+
+  while (unspentTime >= Physics.STEP_MS) {
+    physicsStep();
+    unspentTime -= Physics.STEP_MS;
+  }
+}
+
+// One step: number the keys we're holding, send them, and apply them to our own player right away.
+function physicsStep() {
+  if (myId === null) return; // not joined yet
+
+  inputSeq++;
+  const stepInput = { seq: inputSeq, left: input.left, right: input.right, jump: input.jump };
+  socket.emit("input", stepInput);
+  pendingInputs.push(stepInput);
+
+  // Normally the server answers long before this fills up. This just stops it growing forever.
+  if (pendingInputs.length > 120) pendingInputs.shift();
+
+  if (predictionOn && predicted) Physics.stepPlayer(predicted, stepInput);
+}
 
 // Where every player should be drawn right now.
 function playersToDraw() {
-  if (!interpolationOn || snapshots.length === 0) return players;
+  const result = otherPlayersToDraw();
+
+  // Our own player: with prediction, draw our guess (no waiting for the server).
+  // Without it, draw the newest position the server sent.
+  const mine = players[myId];
+  if (mine && predictionOn && predicted) {
+    result[myId] = { ...mine, x: predicted.x, y: predicted.y, frozen: predicted.frozenSteps > 0 };
+  } else if (mine) {
+    result[myId] = mine;
+  }
+  return result;
+}
+
+// Everyone except us: drawn a little in the past, blended between server updates (interpolation).
+function otherPlayersToDraw() {
+  if (!interpolationOn || snapshots.length === 0) return { ...players };
 
   const t = renderTime();
 
@@ -95,7 +189,7 @@ function playersToDraw() {
 
   const result = {};
   for (const id in after.players) {
-    if (id === myId) continue; // ours comes from the newest update, below
+    if (id === myId) continue; // ours is handled in playersToDraw
     const a = before.players[id];
     const b = after.players[id];
     if (!a) { result[id] = b; continue; } // just joined: nothing to blend from yet
@@ -105,8 +199,6 @@ function playersToDraw() {
       y: a.y + (b.y - a.y) * amount,
     };
   }
-  // Our own player is never delayed: we want to see our keys take effect as soon as possible.
-  if (players[myId]) result[myId] = players[myId];
   return result;
 }
 
@@ -130,19 +222,21 @@ const input = { left: false, right: false, jump: false };
 // Which keyboard key controls which action.
 const keyToAction = { ArrowLeft: "left", ArrowRight: "right", Space: "jump" };
 
+// Just remember what's held. physicsStep() sends it to the server every step.
 function setKey(code, held) {
   const action = keyToAction[code];
-  if (!action) return;
-  // Only tell the server when something actually changes.
-  // (Holding a key makes the browser repeat "keydown" over and over — we ignore those.)
-  if (input[action] === held) return;
-  input[action] = held;
-  socket.emit("input", input);
+  if (action) input[action] = held;
 }
 
 window.addEventListener("keydown", (e) => {
   // I toggles interpolation. (e.repeat is true for the repeats from holding the key down.)
   if (e.code === "KeyI" && !e.repeat) interpolationOn = !interpolationOn;
+  // P toggles prediction. Turning it off forgets our guess; turning it back on
+  // rebuilds it from the next server update.
+  if (e.code === "KeyP" && !e.repeat) {
+    predictionOn = !predictionOn;
+    predicted = null;
+  }
   setKey(e.code, true);
   // Stop arrow keys / space from scrolling the page
   if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Space"].includes(e.code)) e.preventDefault();
@@ -154,8 +248,10 @@ window.addEventListener("blur", () => {
   for (const code in keyToAction) setKey(code, false);
 });
 
-// ===== Draw: paint whatever the server last told us =====
+// ===== Draw: run any physics steps that are due, then paint the world =====
 function draw() {
+  runPhysicsSteps();
+
   ctx.clearRect(0, 0, canvas.width, canvas.height); // wipe last frame
 
   ctx.fillStyle = "#3a7d44"; // green platforms
@@ -228,6 +324,7 @@ function drawPing() {
   ctx.font = "12px sans-serif";
   ctx.fillText("ping: " + (pingMs === null ? "--" : pingMs) + " ms", 8, 18);
   ctx.fillText("interpolation: " + (interpolationOn ? "ON" : "OFF") + " (press I)", 8, 34);
+  ctx.fillText("prediction: " + (predictionOn ? "ON" : "OFF") + " (press P)", 8, 50);
 }
 
 draw(); // start drawing!
