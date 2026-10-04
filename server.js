@@ -2,7 +2,7 @@
 // Pretend the network is slow. Every message the server receives, and every message
 // it sends, waits this many milliseconds first. 0 means no fake lag.
 // Try 100 or 200 to feel what a laggy connection is like.
-const FAKE_LAG_MS = 75;
+const FAKE_LAG_MS = 0;
 
 // ===== Physics =====
 // Gravity, movement and collision live in public/physics.js, which the browser uses too.
@@ -80,6 +80,33 @@ function randomSpawn() {
   return { x: map.width / 2, y: 0 }; // couldn't find anywhere (strange map): drop in from the top middle
 }
 
+// Players respawned at the start of a round try to land at least this far from each other,
+// so "it" can't start right on top of someone.
+const SPAWN_SPACING = 200;
+
+// Like randomSpawn, but tries to keep away from the spots in "taken" ([{ x, y }, ...]).
+// If it can't find one far enough from all of them, it settles for the last one it tried.
+function randomSpawnAwayFrom(taken) {
+  let spot;
+  for (let attempt = 0; attempt < 30; attempt++) {
+    spot = randomSpawn();
+    if (taken.every((t) => Math.hypot(t.x - spot.x, t.y - spot.y) >= SPAWN_SPACING)) break;
+  }
+  return spot;
+}
+
+// Put a player at a spot, standing still. "spawns" counts how many times this has happened,
+// so browsers can tell a respawn (snap straight there) from normal movement (glide there).
+function placePlayer(p, spot) {
+  p.x = spot.x;
+  p.y = spot.y;
+  p.vx = 0;
+  p.vy = 0;
+  p.onGround = false; // they land on the platform under them on their next step
+  p.standingOn = -1;
+  p.spawns++;
+}
+
 // ===== Tag rules =====
 const ROUND_LENGTH = 60 * 1000; // how long a round lasts (milliseconds)
 const FREEZE_TIME = 1.5 * 1000; // how long a newly tagged "it" can't move or tag (milliseconds)
@@ -135,6 +162,19 @@ function withLag(fn) {
 // Each player has a position (x, y), a velocity (vx, vy), and a queue of inputs waiting to run.
 const players = {};
 
+// ===== Names =====
+// The browser sends the name its player typed, but we never trust it: anyone can send anything.
+// A good name is 1-16 characters of letters, numbers, spaces and underscores, and isn't all spaces.
+// Anything else (too long, odd symbols, not even text) gets "Player" plus a number instead.
+const MAX_NAME_LENGTH = 16;
+let nextPlayerNumber = 1;
+
+function checkName(raw) {
+  const name = typeof raw === "string" ? raw.trim() : "";
+  const ok = name.length >= 1 && name.length <= MAX_NAME_LENGTH && /^[A-Za-z0-9 _]+$/.test(name);
+  return ok ? name : "Player" + nextPlayerNumber++;
+}
+
 // Red is saved for "it", so normal players get any hue except the reds (roughly 0-30 and 330-360).
 function randomColor() {
   return "hsl(" + Math.floor(30 + Math.random() * 300) + ", 80%, 55%)";
@@ -149,7 +189,7 @@ const round = {
   phase: "waiting",
   itId: null,     // socket id of whoever is "it"
   endsAt: 0,      // when the current phase ends (a Date.now() time), for "playing" and "results"
-  winner: null,   // { id, color, itTime } of the last round's winner, kept even if they leave
+  winner: null,   // { id, name, color, itTime } of the last round's winner, kept even if they leave
 };
 
 function playerCount() {
@@ -162,8 +202,12 @@ function pickRandomIt() {
 }
 
 function startRound() {
-  // Everyone starts the round with a clean slate.
+  // Everyone starts the round with a clean slate, at a new random spot.
+  const taken = [];
   for (const id in players) {
+    const spot = randomSpawnAwayFrom(taken);
+    taken.push(spot);
+    placePlayer(players[id], spot);
     players[id].itTime = 0;
     players[id].frozenSteps = 0;
     players[id].inRound = true;
@@ -190,7 +234,8 @@ function endRound() {
   round.phase = "results";
   round.endsAt = Date.now() + RESULTS_TIME;
   round.itId = null;
-  round.winner = { id: best.id, color: best.color, itTime: best.itTime };
+  best.wins++;
+  round.winner = { id: best.id, name: best.name, color: best.color, itTime: best.itTime };
 }
 
 function stopRound() {
@@ -259,12 +304,14 @@ function updateRound(now, elapsed) {
   }
 }
 
-// This runs once for every browser that connects.
-io.on("connection", (socket) => {
-  // 1. Add the new player somewhere random, with no inputs yet
+// Add a player who has just joined (with a name we've already checked) somewhere random,
+// with no inputs yet. Then tell them who they are, and send the map so they can draw it
+// and run the same physics for prediction. startTime lets them count ticks like we do.
+function addPlayer(socket, name) {
   const spawn = randomSpawn();
   players[socket.id] = {
     id: socket.id,
+    name,
     x: spawn.x, y: spawn.y,
     vx: 0, vy: 0,
     onGround: false,
@@ -279,17 +326,27 @@ io.on("connection", (socket) => {
     itTime: 0,       // milliseconds spent as "it" this round
     frozenSteps: 0,  // can't move or tag for this many more of their physics steps
     inRound: false,  // true if they were here when the round started (only they can win)
+    spawns: 0,       // how many times they've been put at a new spot (see placePlayer)
+    wins: 0,         // rounds won since they joined
   };
-
-  // 2. Tell the new player who they are, and send the map so they can draw it
-  //    and run the same physics for prediction. startTime lets them count ticks like we do.
   withLag(() => socket.emit("init", { id: socket.id, map, startTime: START_TIME }));
+}
 
-  // 3. The browser sends one numbered input for every physics step: { seq, tick, left, right, jump }.
+// This runs once for every browser that connects.
+io.on("connection", (socket) => {
+  // 1. Nobody is in the game until their browser sends "join" with the name they typed
+  //    (from the start screen). Then we check the name and add them somewhere random.
+  //    A second "join" from the same browser is ignored.
+  socket.on("join", (rawName) => withLag(() => {
+    if (players[socket.id] || !socket.connected) return; // already in, or left while lagging
+    addPlayer(socket, checkName(rawName));
+  }));
+
+  // 2. The browser sends one numbered input for every physics step: { seq, tick, left, right, jump }.
   //    We queue them up and the game loop runs them in order.
   //    We only trust true/false values — anything else counts as "not held".
   //    The number must be a whole number bigger than the last one, or we ignore the input.
-  //    (With fake lag they might have left by the time this runs — the !p check covers that.)
+  //    (With fake lag they might have left by the time this runs, or not joined yet — the !p check covers that.)
   socket.on("input", (input) => withLag(() => {
     const p = players[socket.id];
     if (!p || typeof input !== "object" || input === null) return;
@@ -306,14 +363,15 @@ io.on("connection", (socket) => {
     });
   }));
 
-  // 4. Ping: the browser sends the time it sent the ping, and we send that same number straight back.
+  // 3. Ping: the browser sends the time it sent the ping, and we send that same number straight back.
   //    The browser subtracts it from the time the reply arrives to get the round trip.
   //    With fake lag, the ping waits once on the way in and once on the way out.
   socket.on("ping-check", (sentAt) => withLag(() => {
     withLag(() => socket.emit("pong-check", sentAt));
   }));
 
-  // 5. When they close the tab, remove them. The next tick's state won't include them.
+  // 4. When they close the tab, remove them. The next tick's state won't include them.
+  //    (Their wins go with them: if they come back, they start again from 0.)
   socket.on("disconnect", () => {
     delete players[socket.id];
     // If "it" left mid-round, pick someone else to be "it".
@@ -384,6 +442,9 @@ setInterval(() => {
       vx: p.vx, vy: p.vy, onGround: p.onGround, standingOn: p.standingOn, frozenSteps: p.frozenSteps,
       tick: p.tick, // so browsers can draw riders on a moving platform where it is right now
       lastSeq: p.lastSeq,
+      spawns: p.spawns, // changes when they respawn, so browsers snap to the new spot
+      // For the name labels and the scoreboard:
+      name: p.name, itTime: p.itTime, wins: p.wins, inRound: p.inRound,
     };
   }
   withLag(() => io.emit("state", state));

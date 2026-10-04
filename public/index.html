@@ -4,14 +4,55 @@
     <meta charset="utf-8" />
     <title>Simple Platformer</title>
     <style>
-      /* Center the canvas on a dark background */
+      /* Center the game on a dark background */
       body { margin: 0; background: #222; display: flex; justify-content: center; align-items: center; height: 100vh; }
-      canvas { background: #87ceeb; } /* sky blue */
+      #game-area { position: relative; }
+      canvas { display: block; background: #faf8f2; } /* off-white paper (game.js draws the grid on top) */
+
+      /* ===== Join screen: sits on top of the canvas until we press Play ===== */
+      /* Same doodle look as the game: off-white paper with a faint blue grid, thick black rounded outlines. */
+      #join-screen {
+        position: absolute; inset: 0;
+        display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 18px;
+        background-color: #faf8f2;
+        background-image:
+          linear-gradient(rgba(90, 140, 200, 0.12) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(90, 140, 200, 0.12) 1px, transparent 1px);
+        background-size: 32px 32px;
+        font-family: sans-serif;
+      }
+      #join-screen.hidden { display: none; }
+      #join-screen h1 { margin: 0; font-size: 40px; }
+      #join-screen form { display: flex; gap: 12px; }
+      #join-screen input, #join-screen button {
+        font: bold 18px sans-serif;
+        border: 3px solid #000; border-radius: 10px;
+        padding: 8px 14px;
+        background: #fff;
+      }
+      #join-screen input { width: 220px; outline: none; }
+      #join-screen input:focus { background: #fffbe6; }
+      #join-screen button { cursor: pointer; }
+      #join-screen button:hover { background: #ffe14d; }
+      #join-screen button:active { transform: translateY(2px); }
+      #join-screen p { margin: 0; font-size: 13px; color: #555; }
     </style>
   </head>
   <body>
-    <!-- The canvas is the "drawing board" our game paints onto every frame -->
-    <canvas id="game" width="800" height="450"></canvas>
+    <div id="game-area">
+      <!-- The canvas is the "drawing board" our game paints onto every frame -->
+      <canvas id="game" width="800" height="450"></canvas>
+
+      <!-- Before playing: type a name and press Play. (The server double-checks the name.) -->
+      <div id="join-screen">
+        <h1>Platform Tag</h1>
+        <form id="join-form">
+          <input id="name-input" type="text" maxlength="16" placeholder="Your name" autocomplete="off" spellcheck="false" />
+          <button type="submit">Play</button>
+        </form>
+        <p>Up to 16 letters, numbers, spaces or _</p>
+      </div>
+    </div>
 
     <!-- Socket.IO's server automatically serves its browser library at this address -->
     <script src="/socket.io/socket.io.js"></script>

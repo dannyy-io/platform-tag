@@ -11,7 +11,20 @@ const LAND_DUST_COUNT = 6;       // dust puffs when landing from a full-height f
 const RUN_DUST_CHANCE = 0.3;     // chance (0 to 1) of a dust puff on each running footstep
 const TAG_SPLASH_COUNT = 18;     // paint drops splashed in the tagged player's color
 const JUMPPAD_BURST_COUNT = 10;  // sparks when someone bounces off a jump pad
+const WIN_CONFETTI_COUNT = 40;   // confetti pieces that pop out of the winner when a round ends
 const MAX_PARTICLES = 300;       // never keep more than this many at once, just in case
+const SPLAT_LIFETIME = 4;        // seconds a landing paint splat takes to fade away completely
+const TIMER_WARNING_SECONDS = 5; // the round timer turns red when this many seconds (or fewer) are left
+const JUMPPAD_SQUISH_PUSH = 10;  // how hard a bounce squashes a jump pad's spring (bigger = deeper squash, bigger boing)
+const MAX_SPLATS = 80;           // never keep more splats than this (the oldest go first)
+
+// ===== Doodle style =====
+// The world is drawn like a doodle on notebook paper, to match the characters.
+const PAPER_COLOR = "#faf8f2";                 // off-white paper
+const GRID_COLOR = "rgba(90, 140, 200, 0.12)"; // very faint blue notebook grid
+const GRID_SIZE = 32;                          // pixels between grid lines
+const INK = "#000";                            // outline color, the same as the characters'
+const OUTLINE_WIDTH = 3;                       // outline thickness, the same as the characters'
 
 // ===== Interpolation =====
 // Other players are drawn this many milliseconds in the past, smoothly blended
@@ -31,9 +44,40 @@ let predictionOn = true;
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d"); // the "pen" we draw with
 
+// ===== Join screen =====
+// We aren't in the game until we type a name and press Play (see index.html).
+// The server checks the name and swaps in "Player" plus a number if it isn't allowed.
+const joinScreen = document.getElementById("join-screen");
+const joinForm = document.getElementById("join-form");
+const nameInput = document.getElementById("name-input");
+
+// The name we joined with, or null before pressing Play.
+let myName = null;
+
+// Remember the last name typed in this browser, to save typing it again next time.
+// (Browser storage can be switched off, so this is only a convenience.)
+try { nameInput.value = localStorage.getItem("platform-tag-name") || ""; } catch (e) {}
+nameInput.focus();
+
+joinForm.addEventListener("submit", (e) => {
+  e.preventDefault(); // don't reload the page
+  myName = nameInput.value;
+  try { localStorage.setItem("platform-tag-name", myName); } catch (e) {}
+  nameInput.blur();
+  joinScreen.classList.add("hidden");
+  if (socket.connected) socket.emit("join", myName);
+  // (If we aren't connected yet, the "connect" handler below joins as soon as we are.)
+});
+
 // ===== Multiplayer =====
 // Open a live connection to the server we were loaded from.
 const socket = io();
+
+// Whenever we (re)connect after pressing Play, join with our name. If the connection drops,
+// Socket.IO reconnects by itself, but the server sees a brand new player who has to join again.
+socket.on("connect", () => {
+  if (myName !== null) socket.emit("join", myName);
+});
 
 // Filled in by the server when we join.
 let myId = null;
@@ -99,6 +143,7 @@ socket.on("init", (data) => {
   pendingInputs = [];
   predicted = null;
   camera = null;
+  mySpawns = null;
 });
 
 // Recent updates from the server, oldest first: [{ time, players }, ...]
@@ -120,6 +165,7 @@ function renderTime() {
 // (All the tag rules run on the server.)
 socket.on("state", (state) => {
   noticeTag(players, round, state.players, state.round);
+  noticeWin(round, state.players, state.round);
   players = state.players; // the newest copy, used for our own player
   round = state.round;
 
@@ -138,6 +184,9 @@ socket.on("state", (state) => {
   reconcile(state.players[myId]);
 });
 
+// How many times the server has respawned us, from its latest update. null until the first one.
+let mySpawns = null;
+
 // ===== Reconciliation: fix our guess using the server's answer =====
 // The server's position for us is a little old: it only includes inputs up to number "lastSeq".
 // So we start from the server's position and quickly redo every input it hasn't run yet.
@@ -145,10 +194,17 @@ socket.on("state", (state) => {
 function reconcile(me) {
   if (!me || !map) return;
 
+  // We were just respawned somewhere new (a new round started): jump the camera straight
+  // there instead of sliding it across the whole map.
+  if (mySpawns !== null && me.spawns !== mySpawns) camera = null;
+  mySpawns = me.spawns;
+
   // The server has run these already, so we never need them again.
   pendingInputs = pendingInputs.filter((input) => input.seq > me.lastSeq);
 
   if (!predictionOn) return;
+
+  const before = predicted; // our guess before this answer (null the first time)
 
   // 1. Go back to where the server says we were...
   predicted = {
@@ -159,11 +215,23 @@ function reconcile(me) {
     frozenSteps: me.frozenSteps,
   };
   // 2. ...then replay every input the server hasn't got to yet, each on the same tick as before.
-  //    (Remembering where we were before the last one, for smooth drawing.)
-  predictedPrev = { x: predicted.x, y: predicted.y };
   for (const input of pendingInputs) {
-    predictedPrev = { x: predicted.x, y: predicted.y };
     Physics.stepPlayer(predicted, input, map, input.tick);
+  }
+
+  // 3. We're drawn partway between predictedPrev (one step ago) and predicted (see smoothPredicted).
+  //    Move predictedPrev by however much the server's answer moved our guess: if we guessed right,
+  //    that's nothing at all, so the smooth drawing carries on undisturbed.
+  //    (It can't be rebuilt from the replay: with a fast connection the server has often run every
+  //    input already, so there's nothing to replay. Then predictedPrev ended up equal to predicted,
+  //    which drew us a step ahead until the next step, then back: a jitter every server update.)
+  if (before && predictedPrev) {
+    predictedPrev = {
+      x: predictedPrev.x + (predicted.x - before.x),
+      y: predictedPrev.y + (predicted.y - before.y),
+    };
+  } else {
+    predictedPrev = { x: predicted.x, y: predicted.y };
   }
 }
 
@@ -242,6 +310,7 @@ function playersToDraw() {
       ...mine,
       x, y,
       vx: predicted.vx, vy: predicted.vy, onGround: predicted.onGround, // for the animations
+      standingOn: predicted.standingOn, // for paint splats
       frozen: predicted.frozenSteps > 0,
     };
   } else if (mine) {
@@ -280,29 +349,44 @@ function otherPlayersToDraw() {
     if (id === myId) continue; // ours is handled in playersToDraw
     const a = before.players[id];
     const b = after.players[id];
-    if (!a) { result[id] = b; continue; } // just joined: nothing to blend from yet
+    // Just joined, or respawned somewhere new between the two updates: nothing to blend from,
+    // so draw them straight at the new spot instead of sliding them across the map.
+    if (!a || a.spawns !== b.spawns) { result[id] = b; rideAlong(result, id); continue; }
     result[id] = {
       ...b, // color, "it" and "frozen" from the newer update
       x: a.x + (b.x - a.x) * amount,
       y: a.y + (b.y - a.y) * amount,
     };
+    rideAlong(result, id, a, b, amount);
   }
-  for (const id in result) rideAlong(result, id);
   return result;
 }
 
 // Moving platforms are drawn at the current tick, but other players are drawn a little in the
 // past, so someone riding an elevator would look sunk into it or floating above it.
-// If the newest update says they're riding one, draw them on top of where it is now instead,
-// moved sideways by however far it has gone since the tick they were last at.
-function rideAlong(result, id) {
+// If the newest update says they're riding one, draw them on top of where it is now instead.
+//
+// Where along the platform? We work out how far from the platform's left edge they were in the
+// two updates we're blending between ("a" and "b"), blend THAT, and add it to where the platform
+// is now. So walking along a moving platform glides smoothly like walking anywhere else.
+// (Using only the newest update made their walking jump forward once per update: choppy.)
+// If they weren't on this platform in both updates (they just landed), or interpolation is off,
+// we can only go by the newest update.
+function rideAlong(result, id, a, b, amount) {
   const newest = players[id];
   if (!newest || !newest.onGround || !map) return;
   const platform = map.platforms[newest.standingOn];
   if (!platform || platform.type !== "moving") return;
   const now = Physics.platformPosition(platform, drawTick());
-  const then = Physics.platformPosition(platform, newest.tick);
-  result[id] = { ...result[id], x: newest.x + (now.x - then.x), y: now.y - playerSize };
+
+  // How far from the platform's left edge someone was in an update (at the tick they were on).
+  const along = (u) => u.x - Physics.platformPosition(platform, u.tick).x;
+  const ridingIn = (u) => u && u.onGround && u.standingOn === newest.standingOn;
+
+  let offset;
+  if (ridingIn(a) && ridingIn(b)) offset = along(a) + (along(b) - along(a)) * amount;
+  else offset = along(newest);
+  result[id] = { ...result[id], x: now.x + offset, y: now.y - playerSize };
 }
 
 // The tick moving platforms are drawn at. Like our own player (see smoothPredicted), they're drawn
@@ -348,6 +432,8 @@ function setKey(code, held) {
 }
 
 window.addEventListener("keydown", (e) => {
+  // Typing a name on the join screen: let those keys go into the box, not the game.
+  if (e.target === nameInput) return;
   // I toggles interpolation. (e.repeat is true for the repeats from holding the key down.)
   if (e.code === "KeyI" && !e.repeat) interpolationOn = !interpolationOn;
   // P toggles prediction. Turning it off forgets our guess; turning it back on
@@ -399,70 +485,205 @@ function draw() {
   const dt = Math.min(0.1, (now - lastDrawTime) / 1000); // seconds (capped, in case the tab was hidden)
   lastDrawTime = now;
 
-  ctx.clearRect(0, 0, canvas.width, canvas.height); // wipe last frame
+  ctx.fillStyle = PAPER_COLOR; // wipe last frame with a fresh sheet of paper
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   if (map) drawWorld(dt);
 
   drawRoundInfo();
+  drawScoreboard();
   drawPing();
 
   requestAnimationFrame(draw); // ask the browser to call us again next frame
 }
 
 // ===== Platforms: each type has its own look =====
-function drawPlatform(p, tick) {
+// Every platform is a white (or pale blue, for ice) rounded box with a thick black outline,
+// like the characters. Special ones get one simple doodle on top to show what they do.
+// index is the platform's place in map.platforms (used to find its paint splats).
+function drawPlatform(p, index, tick) {
   const { x, y } = Physics.platformPosition(p, tick);
   const w = p.width, h = p.height;
 
-  if (p.type === "solid") {
-    ctx.fillStyle = "#6b4f3a"; // brown block
-    ctx.fillRect(x, y, w, h);
-  } else if (p.type === "ice") {
-    ctx.fillStyle = "#bfeaf5"; // pale blue
-    ctx.fillRect(x, y, w, h);
-    ctx.fillStyle = "#ffffff"; // shiny white top edge
-    ctx.fillRect(x, y, w, 3);
-    ctx.strokeStyle = "#ffffff"; // a few diagonal glints
-    ctx.lineWidth = 2;
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = OUTLINE_WIDTH;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+
+  // Jump pads: a little spring with a lid, standing on the pad.
+  if (p.type === "jumppad") drawSpring(x, y, w, padSprings[index] ? padSprings[index].squish : 0);
+
+  // The box: fill, then any paint splats on it, then the outline on top so it stays crisp.
+  // (drawSplats draws its own shapes, which replaces the box's path, and save/restore doesn't
+  // bring a path back. So the box is traced again for the outline.)
+  const radius = Math.min(6, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.roundRect(x, y, w, h, radius);
+  ctx.fillStyle = p.type === "ice" ? "#d6effa" : "#fff";
+  ctx.fill();
+  drawSplats(index, x, y);
+  ctx.beginPath();
+  ctx.roundRect(x, y, w, h, radius);
+  ctx.stroke();
+
+  if (p.type === "ice") {
+    // Two short white shine lines near the left end
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 2.5;
     ctx.beginPath();
-    for (let gx = x + 20; gx + 10 < x + w; gx += 60) {
-      ctx.moveTo(gx, y + h - 3);
-      ctx.lineTo(gx + 10, y + 5);
-    }
+    ctx.moveTo(x + 10, y + h - 4); ctx.lineTo(x + 16, y + 4);
+    ctx.moveTo(x + 20, y + h - 4); ctx.lineTo(x + 24, y + 6);
     ctx.stroke();
-  } else if (p.type === "jumppad") {
-    ctx.fillStyle = "#f28c28"; // orange
-    ctx.fillRect(x, y, w, h);
-    // Upward arrows above it, bobbing up and down so it catches the eye
-    const bob = Math.sin(performance.now() / 150) * 3;
-    ctx.fillStyle = "#f2c12e";
-    for (let ax = x + 15; ax <= x + w - 15; ax += 30) {
+  } else if (p.type === "moving") {
+    // Two arrowheads pointing both ways along its track: "<  >"
+    const angle = Math.atan2(p.toY - p.y, p.toX - p.x);
+    ctx.lineWidth = 2;
+    for (const side of [-1, 1]) {
+      ctx.save();
+      ctx.translate(x + w / 2 + side * w * 0.22, y + h / 2);
+      ctx.rotate(angle + (side < 0 ? Math.PI : 0));
       ctx.beginPath();
-      ctx.moveTo(ax - 8, y - 6 + bob);
-      ctx.lineTo(ax, y - 16 + bob);
-      ctx.lineTo(ax + 8, y - 6 + bob);
+      ctx.moveTo(-3, -4); ctx.lineTo(2, 0); ctx.lineTo(-3, 4);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+}
+
+// ===== Jump pad springs: squash down, then boing back up past their normal height =====
+// How squashed each jump pad's spring is, keyed by its index in map.platforms:
+// { squish, speed }. squish 0 = normal height, 1 = flat, below 0 = stretched taller.
+const padSprings = {};
+
+// Someone just bounced off the jump pad under (feetX, feetY): give its spring a push downward.
+function kickPadSpring(feetX, feetY) {
+  if (!map) return;
+  map.platforms.forEach((p, i) => {
+    if (p.type !== "jumppad") return;
+    // Find the pad under their feet. (They've already flown up a little, so allow some room.)
+    // Find the pad under them. Leave plenty of room: their square only needs to overlap the pad,
+    // and other players are drawn a little in the past, so they may still look a bit above it.
+    const margin = playerSize / 2;
+    if (feetX < p.x - margin || feetX > p.x + p.width + margin) return;
+    if (feetY < p.y - 80 || feetY > p.y + p.height + 10) return;
+    const s = padSprings[i] || (padSprings[i] = { squish: 0, speed: 0 });
+    // Start it partly squashed and still moving down, so it visibly sinks, then boings back up.
+    s.squish = Math.max(s.squish, 0.3);
+    s.speed = JUMPPAD_SQUISH_PUSH;
+  });
+}
+
+// Move every spring forward by dt seconds. It's a bouncy spring (not much damping), so after
+// squashing it shoots back up a little past normal and wobbles to a stop.
+function updatePadSprings(dt) {
+  const STIFFNESS = 300, DAMPING = 8;
+  for (const i in padSprings) {
+    const s = padSprings[i];
+    for (let left = dt; left > 0; left -= 1 / 240) { // small sub-steps keep it stable
+      const h = Math.min(left, 1 / 240);
+      s.speed += (-s.squish * STIFFNESS - s.speed * DAMPING) * h;
+      s.squish += s.speed * h;
+    }
+    s.squish = Math.max(-0.6, Math.min(0.8, s.squish)); // never flat or stretched too far
+    if (Math.abs(s.squish) < 0.001 && Math.abs(s.speed) < 0.01) delete padSprings[i]; // at rest
+  }
+}
+
+// A zigzag spring sitting on a jump pad whose top-left is (x, y), with a little lid on top.
+// squish shrinks it (0 = normal, 1 = flat) or stretches it (below 0).
+function drawSpring(x, y, w, squish) {
+  const cx = x + w / 2, half = w * 0.22, height = 12 * (1 - squish), zigs = 4;
+  ctx.beginPath();
+  ctx.moveTo(cx, y);
+  for (let i = 1; i <= zigs; i++) {
+    const zy = y - (height * i) / (zigs + 1);
+    ctx.lineTo(cx + (i % 2 === 0 ? -half : half), zy);
+  }
+  ctx.lineTo(cx, y - height);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.roundRect(cx - w * 0.32, y - height - 4, w * 0.64, 4, 2);
+  ctx.fillStyle = "#fff";
+  ctx.fill();
+  ctx.stroke();
+}
+
+// ===== Paint splats: players leave a little blob of their color where they land =====
+// Each one: { platform (index in map.platforms), dx (how far along the platform it is, so splats
+// ride along on moving platforms), color, born (performance.now()), blob, drops }
+// Splats always sit on the platform's top edge, since that's the only side you can land on.
+const splats = [];
+
+function addSplat(platformIndex, feetX, color) {
+  const p = map && map.platforms[platformIndex];
+  if (!p) return;
+  const pos = Physics.platformPosition(p, drawTick());
+  // A wobbly round blob: 9 points around a circle, each a random distance from the middle...
+  const blob = [];
+  for (let i = 0; i < 9; i++) blob.push(rand(0.7, 1.15));
+  // ...plus two little droplets flicked off to the sides.
+  const drops = [-1, 1].map((side) => ({ x: side * rand(10, 15), y: rand(-1, 3), r: rand(1.2, 2.2) }));
+  if (splats.length >= MAX_SPLATS) splats.shift();
+  splats.push({ platform: platformIndex, dx: feetX - pos.x, color, born: performance.now(), blob, drops });
+}
+
+// Draw the splats on one platform, clipped to the box that was just traced so they look painted on.
+function drawSplats(index, x, y) {
+  const now = performance.now();
+  let clipped = false;
+  for (const s of splats) {
+    if (s.platform !== index) continue;
+    const fade = 1 - (now - s.born) / 1000 / SPLAT_LIFETIME; // 1 = fresh, 0 = gone
+    if (fade <= 0) continue;
+    if (!clipped) { ctx.save(); ctx.clip(); clipped = true; }
+    ctx.globalAlpha = 0.75 * fade;
+    ctx.fillStyle = s.color;
+    // A flattened blob, centered just below the platform's top edge
+    const cx = x + s.dx, cy = y + 2;
+    ctx.beginPath();
+    s.blob.forEach((r, i) => {
+      const a = (i / s.blob.length) * Math.PI * 2;
+      const px = cx + Math.cos(a) * 9 * r, py = cy + Math.sin(a) * 4.5 * r;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    });
+    ctx.closePath();
+    ctx.fill();
+    for (const d of s.drops) {
+      ctx.beginPath();
+      ctx.arc(cx + d.x, cy + d.y, d.r, 0, Math.PI * 2);
       ctx.fill();
     }
-  } else if (p.type === "moving") {
-    ctx.fillStyle = "#7d4fc4"; // purple
-    ctx.fillRect(x, y, w, h);
-    ctx.fillStyle = "#b796ea"; // lighter stripe on top
-    ctx.fillRect(x, y, w, 4);
-  } else {
-    ctx.fillStyle = "#3a7d44"; // plain green platform
-    ctx.fillRect(x, y, w, h);
   }
+  if (clipped) ctx.restore(); // also undoes the clip and the alpha
+  // Forget splats that have faded away completely.
+  while (splats.length && now - splats[0].born > SPLAT_LIFETIME * 1000) splats.shift();
+}
+
+// The faint notebook grid, drawn in map coordinates so it scrolls with the world.
+// Only the lines that are on screen are drawn.
+function drawGrid() {
+  // (One extra square on every side, so a screen shake never shows a gap.)
+  const left = Math.floor(camera.x / GRID_SIZE - 1) * GRID_SIZE;
+  const top = Math.floor(camera.y / GRID_SIZE - 1) * GRID_SIZE;
+  const right = camera.x + canvas.width + GRID_SIZE, bottom = camera.y + canvas.height + GRID_SIZE;
+  ctx.strokeStyle = GRID_COLOR;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let gx = left; gx <= right; gx += GRID_SIZE) { ctx.moveTo(gx, top); ctx.lineTo(gx, bottom); }
+  for (let gy = top; gy <= bottom; gy += GRID_SIZE) { ctx.moveTo(left, gy); ctx.lineTo(right, gy); }
+  ctx.stroke();
 }
 
 // ===== Particles: dust, paint and sparks =====
 // Little dots that fly out, slow down, fade away and disappear. Positions are in map pixels,
 // speeds in pixels per second. They're only for looks, so each browser makes its own.
 // Each one: { x, y, vx, vy, gravity, drag, size, grow, color, life, maxLife }
+// Confetti pieces also have { confetti: true, angle, spin } and are drawn as tumbling paper strips.
 const particles = [];
 
 function addParticle(props) {
   if (particles.length >= MAX_PARTICLES) particles.shift(); // drop the oldest
-  particles.push({ gravity: 0, drag: 0, grow: 0, ...props, maxLife: props.life });
+  particles.push({ gravity: 0, drag: 0, grow: 0, angle: 0, spin: 0, ...props, maxLife: props.life });
 }
 
 // A random number between min and max.
@@ -480,7 +701,7 @@ function landingDust(x, y, fallSpeed) {
       x: x + side * rand(2, 8), y: y - rand(0, 3),
       vx: side * rand(25, 70), vy: -rand(5, 25),
       drag: 5, size: rand(2.5, 4), grow: 5,
-      color: "rgba(235, 228, 215, 0.8)", life: rand(0.3, 0.5),
+      color: "rgba(120, 115, 105, 0.45)", life: rand(0.3, 0.5),
     });
   }
 }
@@ -491,7 +712,7 @@ function runningDust(x, y, vx) {
     x, y: y - rand(0, 2),
     vx: -Math.sign(vx) * rand(10, 30), vy: -rand(8, 20),
     drag: 4, size: rand(1.5, 2.5), grow: 4,
-    color: "rgba(235, 228, 215, 0.7)", life: rand(0.25, 0.4),
+    color: "rgba(120, 115, 105, 0.4)", life: rand(0.25, 0.4),
   });
 }
 
@@ -523,6 +744,22 @@ function tagSplash(x, y, color) {
   }
 }
 
+// Bright paper confetti popping up out of the winner, then fluttering down.
+const CONFETTI_COLORS = ["#ff5c5c", "#ffb84d", "#ffe14d", "#5cd65c", "#4db8ff", "#b366ff"];
+function winConfetti(x, y) {
+  for (let i = 0; i < WIN_CONFETTI_COUNT; i++) {
+    const angle = rand(-Math.PI * 0.85, -Math.PI * 0.15); // upward, spread out to both sides
+    const speed = rand(150, 320);
+    addParticle({
+      x: x + rand(-6, 6), y: y + rand(-6, 6),
+      vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed,
+      gravity: 260, drag: 2.5, size: rand(2.5, 3.5),
+      color: CONFETTI_COLORS[i % CONFETTI_COLORS.length], life: rand(1.2, 1.8),
+      confetti: true, angle: rand(0, Math.PI * 2), spin: rand(-10, 10),
+    });
+  }
+}
+
 // Move every particle forward by dt seconds, and throw away the ones that have run out.
 function updateParticles(dt) {
   for (let i = particles.length - 1; i >= 0; i--) {
@@ -535,6 +772,7 @@ function updateParticles(dt) {
     q.x += q.vx * dt;
     q.y += q.vy * dt;
     q.size = Math.max(0.5, q.size + q.grow * dt);
+    q.angle += q.spin * dt;
   }
 }
 
@@ -542,11 +780,33 @@ function drawParticles() {
   for (const q of particles) {
     ctx.globalAlpha = Math.min(1, q.life / q.maxLife * 1.5); // fade out over the last part of its life
     ctx.fillStyle = q.color;
+    if (q.confetti) {
+      // A little strip of paper. Squeezing its width as it spins makes it look like it's flipping over.
+      ctx.save();
+      ctx.translate(q.x, q.y);
+      ctx.rotate(q.angle);
+      ctx.scale(Math.cos(q.angle * 1.7), 1);
+      ctx.fillRect(-q.size, -q.size / 2, q.size * 2, q.size);
+      ctx.restore();
+      continue;
+    }
     ctx.beginPath();
     ctx.arc(q.x, q.y, q.size, 0, Math.PI * 2);
     ctx.fill();
   }
   ctx.globalAlpha = 1;
+}
+
+// ===== Winning: confetti =====
+// When a round ends, confetti pops out of the winner.
+function noticeWin(oldRound, newPlayers, newRound) {
+  if (oldRound.phase !== "playing" || newRound.phase !== "results" || !newRound.winner) return;
+  const id = newRound.winner.id;
+  const winner = newPlayers[id];
+  if (!winner) return; // they left just as the round ended
+  // If we won, use where we're drawn (our prediction).
+  const at = id === myId && predictionOn && predicted ? predicted : winner;
+  winConfetti(at.x + playerSize / 2, at.y + playerSize / 2);
 }
 
 // ===== Tags: splash and shake =====
@@ -630,15 +890,24 @@ function animatePlayer(id, p, dt) {
   // and falling spreads us a little wider, more the faster we're going. It all eases smoothly.
   const landed = p.onGround && !a.wasOnGround;
   const bounced = a.lastVy > 2 && vy < -5;
+  // Launched by a jump pad: suddenly going up much faster than a normal jump (11) ever can.
+  // (We can't just use "bounced": walking onto a pad that's level with the floor launches you
+  // without falling first.)
+  const launchSpeed = -(Physics.JUMPPAD_STRENGTH + 11) / 2;
+  const launched = vy < launchSpeed && a.lastVy >= launchSpeed;
   // (Landing gives the spring below a push, so the squash grows quickly but smoothly.)
-  if (landed || bounced) a.squashSpeed = LANDING_SQUASH_PUSH;
+  if (landed || bounced || launched) a.squashSpeed = LANDING_SQUASH_PUSH;
 
   // Puffs and sparks at the feet (see "Particles" below).
   const feetX = p.x + playerSize / 2, feetY = p.y + playerSize;
-  if (landed) landingDust(feetX, feetY, a.lastVy);
-  // (Landing and jumping again between two updates also counts as "bounced", so only launches
-  // much faster than a normal jump get sparks.)
-  if (bounced && vy < -(Physics.JUMPPAD_STRENGTH + 11) / 2) jumpPadBurst(feetX, feetY);
+  if (landed) {
+    landingDust(feetX, feetY, a.lastVy);
+    addSplat(p.standingOn, feetX, p.color);
+  }
+  if (launched) {
+    jumpPadBurst(feetX, feetY);
+    kickPadSpring(feetX, feetY);
+  }
   let target = 0;
   if (!p.onGround && vy < 0) target = -0.11 * Math.min(1, -vy / 11); // rising: taller
   if (!p.onGround && vy > 0) target = 0.08 * Math.min(1, vy / 11);   // falling: wider
@@ -793,7 +1062,7 @@ function drawCharacter(x, bottom, color, pose, isIt) {
 
 // A faint dashed line showing the track a moving platform goes back and forth along.
 function drawTrack(p) {
-  ctx.strokeStyle = "rgba(90, 50, 140, 0.35)";
+  ctx.strokeStyle = "rgba(0, 0, 0, 0.2)"; // light pencil
   ctx.lineWidth = 2;
   ctx.setLineDash([6, 6]);
   ctx.beginPath();
@@ -818,8 +1087,10 @@ function drawWorld(dt) {
   ctx.translate(-camera.x + shake.x, -camera.y + shake.y);
 
   const tick = drawTick();
+  drawGrid();
   for (const p of map.platforms) if (p.type === "moving") drawTrack(p); // tracks go behind everything
-  for (const p of map.platforms) drawPlatform(p, tick);
+  updatePadSprings(dt);
+  map.platforms.forEach((p, i) => drawPlatform(p, i, tick));
 
   // Forget the animations of anyone who has left.
   for (const id in anims) if (!drawn[id]) delete anims[id];
@@ -834,19 +1105,17 @@ function drawWorld(dt) {
     ctx.globalAlpha = 1;
     drawIceCube(p.x + playerSize / 2, p.y + playerSize, pose.ice);
 
-    // Labels stack upward above the character: "you" first, then "IT" above that.
+    // Labels stack upward above the character: their name first (ours in bold), then "IT" above that.
+    // Each gets a white edge so it stays readable over platforms and outlines.
     ctx.textAlign = "center";
+    ctx.lineJoin = "round";
     let labelY = p.y - 8;
-    if (id === myId) {
-      ctx.fillStyle = "#000";
-      ctx.font = "12px sans-serif";
-      ctx.fillText("you", p.x + playerSize / 2, labelY);
-      labelY -= 14;
-    }
+    ctx.font = (id === myId ? "bold " : "") + "12px sans-serif";
+    outlinedText(p.name || "", p.x + playerSize / 2, labelY, "#000");
+    labelY -= 14;
     if (p.it) {
-      ctx.fillStyle = "red";
       ctx.font = "bold 14px sans-serif";
-      ctx.fillText("IT", p.x + playerSize / 2, labelY);
+      outlinedText("IT", p.x + playerSize / 2, labelY, "red");
     }
   }
 
@@ -872,13 +1141,15 @@ function drawRoundInfo() {
     const seconds = Math.ceil(round.timeLeft / 1000);
     const m = Math.floor(seconds / 60);
     const s = String(seconds % 60).padStart(2, "0");
+    // The last few seconds turn red, to show time is nearly up.
+    if (seconds <= TIMER_WARNING_SECONDS) ctx.fillStyle = "red";
     ctx.fillText(m + ":" + s, centerX, 30);
   } else if (round.phase === "results" && round.winner) {
     const w = round.winner;
     const itSeconds = (w.itTime / 1000).toFixed(1);
-    const text = w.id === myId ? "You win!" : "Winner:";
+    const text = w.id === myId ? "You win!" : "Winner: " + w.name;
     ctx.fillText(text, centerX - 20, 30);
-    // A little character in the winner's color, since players don't have names
+    // A little character in the winner's color next to it
     ctx.save();
     ctx.translate(centerX + ctx.measureText(text).width / 2 + 3, 36);
     ctx.scale(0.8, 0.8);
@@ -886,7 +1157,87 @@ function drawRoundInfo() {
     ctx.restore();
     ctx.fillStyle = "#000";
     ctx.font = "14px sans-serif";
-    ctx.fillText("(only " + itSeconds + "s as IT) - next round soon", centerX, 54);
+    // During the results, timeLeft is how long until the next round starts.
+    const startsIn = Math.max(1, Math.ceil(round.timeLeft / 1000));
+    ctx.fillText("(only " + itSeconds + "s as IT) - next round in " + startsIn + "...", centerX, 54);
+  }
+}
+
+// Text with a white edge around it, in the current font and alignment.
+function outlinedText(text, x, y, color) {
+  ctx.strokeStyle = "#fff";
+  ctx.lineWidth = 3;
+  ctx.strokeText(text, x, y);
+  ctx.fillStyle = color;
+  ctx.fillText(text, x, y);
+}
+
+// Shorten text with "..." until it fits in maxWidth pixels (in the current font).
+function fitText(text, maxWidth) {
+  if (ctx.measureText(text).width <= maxWidth) return text;
+  while (text.length > 1 && ctx.measureText(text + "...").width > maxWidth) text = text.slice(0, -1);
+  return text + "...";
+}
+
+// ===== Scoreboard in the top-right corner =====
+// Everyone's name, how long they've been "it" this round, and how many rounds they've won.
+// Whoever is winning this round (least time as "it") is on top. People who joined partway
+// through can't win this round, so they go below everyone who can.
+const SCOREBOARD_WIDTH = 210;
+const SCOREBOARD_MAX_ROWS = 10;
+
+function drawScoreboard() {
+  const rows = Object.entries(players).map(([id, p]) => ({ id, ...p }));
+  if (rows.length === 0) return;
+  rows.sort((a, b) =>
+    (b.inRound - a.inRound) ||   // can win this round first
+    (a.itTime - b.itTime) ||     // then least time as "it"
+    (b.wins - a.wins) ||         // then most wins
+    a.name.localeCompare(b.name));
+  const shown = rows.slice(0, SCOREBOARD_MAX_ROWS);
+
+  const rowHeight = 18, padding = 8;
+  const x = canvas.width - SCOREBOARD_WIDTH - 8, y = 8;
+  const height = padding * 2 + rowHeight * (shown.length + 1);
+  const itColumn = x + SCOREBOARD_WIDTH - 52;  // right edge of the "IT" column
+  const winsColumn = x + SCOREBOARD_WIDTH - padding; // right edge of the "Wins" column
+
+  // A white card with a thick black rounded outline, like the platforms
+  ctx.beginPath();
+  ctx.roundRect(x, y, SCOREBOARD_WIDTH, height, 8);
+  ctx.fillStyle = "#fff";
+  ctx.fill();
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = OUTLINE_WIDTH;
+  ctx.stroke();
+
+  // Headings
+  let rowY = y + padding + 13;
+  ctx.font = "bold 12px sans-serif";
+  ctx.fillStyle = "#777";
+  ctx.textAlign = "left";
+  ctx.fillText("Name", x + padding + 14, rowY);
+  ctx.textAlign = "right";
+  ctx.fillText("IT", itColumn, rowY);
+  ctx.fillText("Wins", winsColumn, rowY);
+
+  for (const r of shown) {
+    rowY += rowHeight;
+    // Their color as a little dot, their name (ours in bold), "it" in red
+    ctx.beginPath();
+    ctx.arc(x + padding + 5, rowY - 4, 4.5, 0, Math.PI * 2);
+    ctx.fillStyle = r.color;
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    ctx.font = (r.id === myId ? "bold " : "") + "12px sans-serif";
+    ctx.fillStyle = r.it ? "red" : "#000";
+    ctx.textAlign = "left";
+    ctx.fillText(fitText(r.name, itColumn - 40 - (x + padding + 14)), x + padding + 14, rowY);
+    ctx.textAlign = "right";
+    ctx.fillText((r.itTime / 1000).toFixed(1) + "s", itColumn, rowY);
+    ctx.fillText(String(r.wins), winsColumn, rowY);
   }
 }
 
