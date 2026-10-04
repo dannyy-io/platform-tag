@@ -221,6 +221,7 @@
   exports.ICE_SLIPPERINESS = ICE_SLIPPERINESS;
   exports.ORB_RADIUS = ORB_RADIUS;
   exports.POWERUP_STEPS = POWERUP_STEPS;
+  exports.SPEED_BOOST = SPEED_BOOST;
   exports.overlaps = overlaps;
   exports.platformPosition = platformPosition;
   exports.stepPlayer = stepPlayer;

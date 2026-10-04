@@ -392,6 +392,10 @@ socket.on("init", (data) => {
   predicted = null;
   camera = null;
   mySpawns = null;
+  // Nothing plays on our first update: everyone's previous state is forgotten, so there's
+  // nothing to compare with yet.
+  mySoundMemory = newSoundMemory();
+  for (const id in soundMemories) delete soundMemories[id];
 });
 
 // Recent updates from the server, oldest first: [{ time, players }, ...]
@@ -446,6 +450,8 @@ function reconcile(me) {
   // We were just respawned somewhere new (a new round started): jump the camera straight
   // there instead of sliding it across the whole map.
   if (mySpawns !== null && me.spawns !== mySpawns) camera = null;
+  // (Respawning isn't a jump or a fall: stay quiet until we're standing on something.)
+  if (me.spawns !== mySpawns) mySoundMemory = newSoundMemory();
   mySpawns = me.spawns;
 
   // The server has run these already, so we never need them again.
@@ -531,7 +537,10 @@ function physicsStep() {
 
   if (predictionOn && predicted) {
     predictedPrev = { x: predicted.x, y: predicted.y };
+    const before = soundState(predicted);
     Physics.stepPlayer(predicted, stepInput, map, currentTick);
+    // A brand-new step (never a replayed one, see reconcile): play whatever it made happen.
+    movementSounds(mySoundMemory, before, predicted, Physics.STEP_MS / 1000, true);
   }
 }
 
@@ -1277,6 +1286,112 @@ function noticeTag(oldPlayers, oldRound, newPlayers, newRound) {
   if (newIt === myId || oldIt === myId) shakeTimeLeft = SHAKE_DURATION;
 }
 
+// ===== Movement sounds: jumps, landings, footsteps, jump pads and orbs =====
+// The server doesn't announce any of these: every browser already gets every player's state,
+// so we spot them ourselves by comparing each player's state with what it was just before.
+// - Our own player is checked right after each brand-new predicted physics step (see physicsStep),
+//   so we hear it the instant we press a key. Replaying inputs in reconcile never plays anything,
+//   or every sound would play two or three times.
+// - Everyone else is checked every frame from where they're drawn (interpolated), and heard
+//   from where they are on the map (see sound.js).
+const STEP_INTERVAL = 0.3;      // seconds between footsteps while walking (shorter with the speed powerup)
+const FIRST_STEP_DELAY = 0.08;  // seconds from starting to walk until the first footstep
+const MY_STEP_VOLUME = 0.6;     // our own footsteps
+const OTHER_STEP_VOLUME = 0.3;  // other players' footsteps (distance makes them quieter still)
+const WALK_SPEED = 0.5;         // moving sideways faster than this on the ground counts as walking
+const LAND_SOFT_SPEED = 2;      // landing while falling this fast (or slower) is at the quietest...
+const LAND_HARD_SPEED = 16;     // ...and this fast (or faster) at full volume. A full jump lands at about 11.
+const LAND_MIN_VOLUME = 0.25;
+const LAND_VOLUME = 0.75;       // every landing is scaled by this (the quietest is LAND_MIN_VOLUME * LAND_VOLUME)
+const JUMP_VOLUME = 0.8;
+// After joining or respawning we stay silent until we're standing on something
+// (a fresh spawn drops onto its platform, which shouldn't sound like a landing).
+// This is just a limit, in case they never touch the ground.
+const QUIET_SECONDS = 0.5;
+
+// Each player's sound memory: { quiet, quietTime, nextStep }, plus for players heard from where
+// they're drawn: last (their state last frame) and spawns.
+function newSoundMemory() {
+  return { quiet: true, quietTime: 0, nextStep: FIRST_STEP_DELAY };
+}
+
+// Our own player's memory (made fresh when we join and whenever we respawn).
+let mySoundMemory = newSoundMemory();
+// Everyone heard from where they're drawn, keyed by id (other players, and us with prediction off).
+const soundMemories = {};
+
+// Just the parts of a player's state we compare.
+function soundState(p) {
+  return { onGround: p.onGround, vy: p.vy || 0, usedOrb: p.usedOrb };
+}
+
+// Play whatever happened between "before" and "after" (a player's state dt seconds apart).
+// mine: our own player, heard at full volume. Otherwise it's heard from where they are.
+function movementSounds(mem, before, after, dt, mine) {
+  const play = (name, volume) => {
+    if (mine) Sound.play(name, { volume });
+    else Sound.play(name, { volume, x: after.x + playerSize / 2, y: after.y + playerSize });
+  };
+
+  if (mem.quiet) {
+    mem.quietTime += dt;
+    if (after.onGround || mem.quietTime >= QUIET_SECONDS) mem.quiet = false;
+    return;
+  }
+
+  const vy = after.vy || 0, wasVy = before.vy || 0;
+  // Launched by a jump pad: suddenly going up much faster than a normal jump ever can
+  // (the same test as the squash in animatePlayer).
+  const launchSpeed = -(Physics.JUMPPAD_STRENGTH + 11) / 2;
+  // Landing: louder the faster they were falling. The next footstep waits a whole step.
+  const land = () => {
+    const hard = Math.min(1, Math.max(0, (wasVy - LAND_SOFT_SPEED) / (LAND_HARD_SPEED - LAND_SOFT_SPEED)));
+    play("land", (LAND_MIN_VOLUME + (1 - LAND_MIN_VOLUME) * hard) * LAND_VOLUME);
+    mem.nextStep = STEP_INTERVAL;
+  };
+
+  if (after.usedOrb >= 0 && after.usedOrb !== before.usedOrb) play("orb", 1);
+  else if (vy < launchSpeed && wasVy >= launchSpeed) play("jumppad", 1);
+  else if (before.onGround && !after.onGround && vy < 0) play("jump", JUMP_VOLUME);
+  else if (!before.onGround && !after.onGround && wasVy >= 0 && vy < 0) {
+    // Falling before, rising now, and it wasn't an orb or a jump pad: they landed and jumped
+    // straight off again (holding jump does that on the very next step). The server only sends
+    // 30 updates a second, about 2 physics steps each, so the update where they were standing
+    // can be skipped completely. We still heard both.
+    land();
+    play("jump", JUMP_VOLUME);
+  }
+
+  if (!before.onGround && after.onGround) land();
+
+  // Footsteps while walking along the ground (riding a moving platform doesn't count: vx is only
+  // their own speed). Sliding on ice still counts, since their feet are still moving.
+  const platform = after.onGround && map && map.platforms[after.standingOn];
+  if (!platform || Math.abs(after.vx || 0) <= WALK_SPEED) {
+    mem.nextStep = FIRST_STEP_DELAY;
+    return;
+  }
+  mem.nextStep -= dt;
+  if (mem.nextStep <= 0) {
+    play(platform.type === "ice" ? "step_ice" : "step", mine ? MY_STEP_VOLUME : OTHER_STEP_VOLUME);
+    const speedUp = after.speedSteps > 0 ? Physics.SPEED_BOOST : 1;
+    mem.nextStep += STEP_INTERVAL / speedUp;
+    if (mem.nextStep <= 0) mem.nextStep = STEP_INTERVAL / speedUp; // (in case of a very long frame)
+  }
+}
+
+// A player heard from where they're drawn this frame. The first time we see them, and whenever
+// they respawn or teleport (spawns changes), we just remember them and stay quiet.
+function drawnPlayerSounds(id, p, dt, mine) {
+  const mem = soundMemories[id];
+  if (!mem || mem.spawns !== p.spawns) {
+    soundMemories[id] = { ...newSoundMemory(), spawns: p.spawns, last: soundState(p) };
+    return;
+  }
+  movementSounds(mem, mem.last, p, dt, mine);
+  mem.last = soundState(p);
+}
+
 // Seconds of screen shake left (0 = not shaking).
 let shakeTimeLeft = 0;
 
@@ -1570,9 +1685,14 @@ function drawWorld(dt) {
 
   // Forget the animations of anyone who has left.
   for (const id in anims) if (!drawn[id]) delete anims[id];
+  for (const id in soundMemories) if (!drawn[id]) delete soundMemories[id];
 
   for (const id in drawn) {
     const p = drawn[id];
+    // Other players' movement sounds come from where they're drawn. Ours come from physicsStep,
+    // unless prediction is off: then we're drawn where the server says, so we're heard from that too.
+    if (id !== myId) drawnPlayerSounds(id, p, dt, false);
+    else if (!(predictionOn && predicted)) drawnPlayerSounds(id, p, dt, true);
     // Each character stands on the bottom middle of its collision square.
     // A frozen "it" is see-through and stuck in an ice cube until they can move.
     const pose = animatePlayer(id, p, dt);
