@@ -58,6 +58,9 @@ let pendingInputs = [];
 // Where we think our own player is right now: { x, y, vx, vy, onGround, standingOn, frozenSteps }.
 // null until the first update from the server (we need its starting point).
 let predicted = null;
+// Where our player was one physics step before "predicted": { x, y }. We draw somewhere between
+// the two (see smoothPredicted), so we glide smoothly even on screens faster than 60 frames a second.
+let predictedPrev = null;
 
 // ===== Ticks =====
 // Moving platforms are positioned by tick number (see platformPosition in physics.js).
@@ -145,7 +148,12 @@ function reconcile(me) {
     frozenSteps: me.frozenSteps,
   };
   // 2. ...then replay every input the server hasn't got to yet, each on the same tick as before.
-  for (const input of pendingInputs) Physics.stepPlayer(predicted, input, map, input.tick);
+  //    (Remembering where we were before the last one, for smooth drawing.)
+  predictedPrev = { x: predicted.x, y: predicted.y };
+  for (const input of pendingInputs) {
+    predictedPrev = { x: predicted.x, y: predicted.y };
+    Physics.stepPlayer(predicted, input, map, input.tick);
+  }
 }
 
 // ===== Fixed time step =====
@@ -186,7 +194,28 @@ function physicsStep() {
   // Normally the server answers long before this fills up. This just stops it growing forever.
   if (pendingInputs.length > 120) pendingInputs.shift();
 
-  if (predictionOn && predicted) Physics.stepPlayer(predicted, stepInput, map, currentTick);
+  if (predictionOn && predicted) {
+    predictedPrev = { x: predicted.x, y: predicted.y };
+    Physics.stepPlayer(predicted, stepInput, map, currentTick);
+  }
+}
+
+// How far we are through the current physics step: 0 = it just ran, nearly 1 = the next is due.
+function stepFraction() {
+  return Math.min(1, Math.max(0, unspentTime / Physics.STEP_MS));
+}
+
+// Our predicted position only changes 60 times a second, but the screen may redraw more often
+// (or at uneven moments). Drawing it straight away would make it move in uneven jerks.
+// Instead we draw it partway between the last two steps, by how far we are through this step.
+// That draws us at most one step (1/60 s) behind, but moving perfectly smoothly.
+function smoothPredicted() {
+  if (!predictedPrev) return { x: predicted.x, y: predicted.y };
+  const t = stepFraction();
+  return {
+    x: predictedPrev.x + (predicted.x - predictedPrev.x) * t,
+    y: predictedPrev.y + (predicted.y - predictedPrev.y) * t,
+  };
 }
 
 // Where every player should be drawn right now.
@@ -197,7 +226,13 @@ function playersToDraw() {
   // Without it, draw the newest position the server sent.
   const mine = players[myId];
   if (mine && predictionOn && predicted) {
-    result[myId] = { ...mine, x: predicted.x, y: predicted.y, frozen: predicted.frozenSteps > 0 };
+    const { x, y } = smoothPredicted();
+    result[myId] = {
+      ...mine,
+      x, y,
+      vx: predicted.vx, vy: predicted.vy, onGround: predicted.onGround, // for the animations
+      frozen: predicted.frozenSteps > 0,
+    };
   } else if (mine) {
     result[myId] = mine;
   }
@@ -259,10 +294,11 @@ function rideAlong(result, id) {
   result[id] = { ...result[id], x: newest.x + (now.x - then.x), y: now.y - playerSize };
 }
 
-// The tick moving platforms are drawn at: the one our own player was last moved on,
-// so when we ride one we're drawn exactly on top of it.
+// The tick moving platforms are drawn at. Like our own player (see smoothPredicted), they're drawn
+// partway between the last two ticks, so they glide smoothly and when we ride one we're drawn
+// exactly on top of it. (platformPosition works fine with a tick like 1234.6.)
 function drawTick() {
-  return currentTick !== null ? currentTick : estimatedServerTick();
+  return currentTick !== null ? currentTick - 1 + stepFraction() : estimatedServerTick();
 }
 
 // ===== Ping =====
@@ -407,6 +443,207 @@ function drawPlatform(p, tick) {
   }
 }
 
+// ===== Characters =====
+// Players are round little characters (see art/character.png), drawn here with shapes.
+// This is ONLY for looks: the physics still uses the same PLAYER_SIZE square as before,
+// and all the animation below happens in the browser without touching the physics.
+
+// How hard landing pushes the squash. Bigger = squashes wider on landing.
+// (With the spring in animatePlayer, 3 adds roughly 7% extra width at the peak.)
+const LANDING_SQUASH_PUSH = 3;
+
+// Animation memory for each player, keyed by id:
+// { walkPhase, walkAmount, squash, squashSpeed, eyeX, wasOnGround, lastVy }
+const anims = {};
+
+// Move each number part of the way toward where it's heading, the same way at any frame rate.
+// Bigger rate = gets there faster.
+function approach(value, target, rate, dt) {
+  return value + (target - value) * (1 - Math.exp(-rate * dt));
+}
+
+// Advance one player's animation by dt seconds, and work out the pose to draw them in.
+function animatePlayer(id, p, dt) {
+  const vx = p.vx || 0, vy = p.vy || 0;
+  let a = anims[id];
+  if (!a) {
+    a = anims[id] = {
+      walkPhase: 0, walkAmount: 0, squash: 0, squashSpeed: 0, eyeX: 0, wasOnGround: p.onGround, lastVy: vy,
+      ice: p.frozen ? 1 : 0,
+    };
+  }
+
+  // The ice cube around a frozen player pops in when they're frozen and fades away when they thaw.
+  a.ice = approach(a.ice, p.frozen ? 1 : 0, 14, dt);
+
+  // Walking: the feet step faster the faster we move (one full left-right cycle every 40 pixels).
+  // walkAmount fades from 0 (standing) to 1 (walking) so starting and stopping look smooth.
+  const walking = p.onGround && Math.abs(vx) > 0.3;
+  if (walking) a.walkPhase += Math.abs(vx) * (1000 / Physics.STEP_MS) * dt * (2 * Math.PI / 40);
+  a.walkAmount = approach(a.walkAmount, walking ? 1 : 0, 12, dt);
+
+  // The eyes look a little toward where we're moving, and back to the middle when we stop.
+  a.eyeX = approach(a.eyeX, walking || !p.onGround ? Math.sign(vx) * 2.5 : 0, 10, dt);
+
+  // Squash and stretch. squash > 0 = wider and shorter, squash < 0 = taller and thinner.
+  // Landing (or bouncing off a jump pad) squashes us for a moment. Going up stretches us taller,
+  // and falling spreads us a little wider, more the faster we're going. It all eases smoothly.
+  const landed = p.onGround && !a.wasOnGround;
+  const bounced = a.lastVy > 2 && vy < -5;
+  // (Landing gives the spring below a push, so the squash grows quickly but smoothly.)
+  if (landed || bounced) a.squashSpeed = LANDING_SQUASH_PUSH;
+  let target = 0;
+  if (!p.onGround && vy < 0) target = -0.11 * Math.min(1, -vy / 11); // rising: taller
+  if (!p.onGround && vy > 0) target = 0.08 * Math.min(1, vy / 11);   // falling: wider
+
+  // squash follows its target like a spring instead of jumping straight there: it starts slowly,
+  // speeds up, then eases in, so changing shape looks curved and natural.
+  // Stiffer = gets there faster; more damping = less wobble. Damping of 2 * sqrt(stiffness)
+  // settles as fast as possible without overshooting. (Small sub-steps keep it stable.)
+  const SQUASH_STIFFNESS = 220, SQUASH_DAMPING = 30;
+  for (let left = dt; left > 0; left -= 1 / 240) {
+    const h = Math.min(left, 1 / 240);
+    a.squashSpeed += ((target - a.squash) * SQUASH_STIFFNESS - a.squashSpeed * SQUASH_DAMPING) * h;
+    a.squash += a.squashSpeed * h;
+  }
+  a.wasOnGround = p.onGround;
+  a.lastVy = vy;
+
+  // Standing still: a slow, slight up-and-down bob. Walking: a little hop with each step.
+  const idleBob = Math.sin(performance.now() / 400) * 0.8 * (1 - a.walkAmount);
+  const walkBob = Math.abs(Math.sin(a.walkPhase)) * 1.5 * a.walkAmount;
+
+  return {
+    tucked: !p.onGround,
+    scaleX: 1 + a.squash,
+    scaleY: 1 - a.squash,
+    bodyLift: idleBob + walkBob,
+    // Each foot lifts during its half of the step, and swings forward and back a little.
+    leftFootLift: Math.max(0, Math.sin(a.walkPhase)) * 3 * a.walkAmount,
+    rightFootLift: Math.max(0, -Math.sin(a.walkPhase)) * 3 * a.walkAmount,
+    footSwing: Math.cos(a.walkPhase) * 1.5 * a.walkAmount,
+    eyeX: a.eyeX,
+    ice: a.ice,
+  };
+}
+
+// A see-through ice cube around a character whose feet are at (x, bottom).
+// amount goes from 0 (no ice) to 1 (fully frozen): the cube grows in and fades in with it.
+function drawIceCube(x, bottom, amount) {
+  if (amount < 0.01) return;
+  ctx.save();
+  ctx.translate(x, bottom);
+  const grow = 0.6 + 0.4 * amount;
+  ctx.scale(grow, grow);
+  ctx.globalAlpha *= amount;
+
+  // Just big enough to hold the character, arms and all (positions are from its feet, up is negative).
+  const left = -21, top = -36, width = 42, height = 37;
+
+  // The cube: pale blue, see-through, with a darker icy edge
+  ctx.beginPath();
+  ctx.roundRect(left, top, width, height, 5);
+  ctx.fillStyle = "rgba(170, 225, 250, 0.45)";
+  ctx.fill();
+  ctx.strokeStyle = "rgba(70, 150, 200, 0.9)";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // A lighter strip across the top, like the top face of the cube
+  ctx.fillStyle = "rgba(255, 255, 255, 0.45)";
+  ctx.beginPath();
+  ctx.roundRect(left + 3, top + 3, width - 6, 5, 2);
+  ctx.fill();
+
+  // Shiny glints: two diagonal streaks in the top-left corner and one bottom-right
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
+  ctx.lineWidth = 2;
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(left + 5, top + 18); ctx.lineTo(left + 12, top + 11);
+  ctx.moveTo(left + 5, top + 25); ctx.lineTo(left + 9, top + 21);
+  ctx.moveTo(left + width - 10, top + height - 5); ctx.lineTo(left + width - 5, top + height - 10);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+// The pose a character stands in when it isn't doing anything (used for the winner's icon).
+const STILL_POSE = {
+  tucked: false, scaleX: 1, scaleY: 1, bodyLift: 0,
+  leftFootLift: 0, rightFootLift: 0, footSwing: 0, eyeX: 0, ice: 0,
+};
+
+// A filled ellipse with a thick black outline.
+function blob(x, y, rx, ry, fill) {
+  ctx.beginPath();
+  ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+  ctx.fillStyle = fill;
+  ctx.fill();
+  ctx.stroke();
+}
+
+// Draw one character standing with its feet at (x, bottom). Positions below are in pixels from
+// that point: negative y is up. Squash and stretch scale it from the feet, so it stays on the ground.
+function drawCharacter(x, bottom, color, pose, isIt) {
+  ctx.save();
+  ctx.translate(x, bottom);
+  ctx.scale(pose.scaleX, pose.scaleY);
+  ctx.strokeStyle = "#000";
+  ctx.lineWidth = 3;
+
+  // Walking: a big round body. Tucked: a slightly smaller ball, sitting lower.
+  const radius = pose.tucked ? 11.5 : 13;
+  const bodyY = (pose.tucked ? -12.5 : -16) - pose.bodyLift;
+
+  // Whoever is "it" gets a soft, glowing red outline. It's drawn first so it sits behind
+  // everything else (feet, body and arms all cover it).
+  if (isIt) {
+    ctx.save();
+    ctx.shadowColor = "rgba(255, 0, 0, 0.6)";
+    ctx.shadowBlur = 8;
+    ctx.strokeStyle = "rgba(255, 0, 0, 0.55)";
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.arc(0, bodyY, radius, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  if (!pose.tucked) {
+    // Stubby feet, behind the bottom of the body
+    blob(-6 + pose.footSwing, -3 - pose.leftFootLift, 4.5, 3, "#000");
+    blob(6 - pose.footSwing, -3 - pose.rightFootLift, 4.5, 3, "#000");
+  }
+
+  // The body, filled with the player's color
+  blob(0, bodyY, radius, radius, color);
+
+  if (pose.tucked) {
+    // Arms pressed flat against the sides, feet tucked in underneath
+    blob(-radius + 1, bodyY + 1, 2.5, 4.5, color);
+    blob(radius - 1, bodyY + 1, 2.5, 4.5, color);
+    blob(-5, -1.5, 4, 2.5, "#000");
+    blob(5, -1.5, 4, 2.5, "#000");
+  } else {
+    // Small curled arms sticking out of the sides
+    blob(-radius - 1, bodyY + 4, 3.5, 4.5, color);
+    blob(radius + 1, bodyY + 4, 3.5, 4.5, color);
+  }
+
+  // Two dot eyes, low on the face, looking a little toward where we're going
+  // (a little closer together on the smaller tucked ball)
+  ctx.fillStyle = "#000";
+  const eyeGap = pose.tucked ? 4 : 4.5;
+  for (const side of [-1, 1]) {
+    ctx.beginPath();
+    ctx.arc(pose.eyeX + side * eyeGap, bodyY + (pose.tucked ? 3.5 : 4), 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.restore();
+}
+
 // A faint dashed line showing the track a moving platform goes back and forth along.
 function drawTrack(p) {
   ctx.strokeStyle = "rgba(90, 50, 140, 0.35)";
@@ -426,26 +663,31 @@ function drawWorld(dt) {
   if (camera === null) return; // we haven't appeared yet
 
   // Shift everything we draw from now on by the camera position. A platform at map x = 1000
-  // with the camera at x = 900 lands at canvas x = 100. Rounding to whole pixels keeps
-  // edges crisp instead of blurry while the camera glides.
+  // with the camera at x = 900 lands at canvas x = 100. (No rounding to whole pixels: the players
+  // aren't rounded, so a rounded camera made them wobble back and forth by a pixel.)
   ctx.save();
-  ctx.translate(-Math.round(camera.x), -Math.round(camera.y));
+  ctx.translate(-camera.x, -camera.y);
 
   const tick = drawTick();
   for (const p of map.platforms) if (p.type === "moving") drawTrack(p); // tracks go behind everything
   for (const p of map.platforms) drawPlatform(p, tick);
 
+  // Forget the animations of anyone who has left.
+  for (const id in anims) if (!drawn[id]) delete anims[id];
+
   for (const id in drawn) {
     const p = drawn[id];
-    // Whoever is "it" is drawn in red. A frozen "it" is see-through until they can move.
+    // Each character stands on the bottom middle of its collision square.
+    // A frozen "it" is see-through and stuck in an ice cube until they can move.
+    const pose = animatePlayer(id, p, dt);
     ctx.globalAlpha = p.frozen ? 0.5 : 1;
-    ctx.fillStyle = p.it ? "red" : p.color;
-    ctx.fillRect(p.x, p.y, playerSize, playerSize);
+    drawCharacter(p.x + playerSize / 2, p.y + playerSize, p.color, pose, p.it);
     ctx.globalAlpha = 1;
+    drawIceCube(p.x + playerSize / 2, p.y + playerSize, pose.ice);
 
-    // Labels stack upward above the square: "you" first, then "IT" above that.
+    // Labels stack upward above the character: "you" first, then "IT" above that.
     ctx.textAlign = "center";
-    let labelY = p.y - 6;
+    let labelY = p.y - 8;
     if (id === myId) {
       ctx.fillStyle = "#000";
       ctx.font = "12px sans-serif";
@@ -483,9 +725,12 @@ function drawRoundInfo() {
     const itSeconds = (w.itTime / 1000).toFixed(1);
     const text = w.id === myId ? "You win!" : "Winner:";
     ctx.fillText(text, centerX - 20, 30);
-    // A square in the winner's color, since players don't have names
-    ctx.fillStyle = w.color;
-    ctx.fillRect(centerX + ctx.measureText(text).width / 2 - 8, 12, 22, 22);
+    // A little character in the winner's color, since players don't have names
+    ctx.save();
+    ctx.translate(centerX + ctx.measureText(text).width / 2 + 3, 36);
+    ctx.scale(0.8, 0.8);
+    drawCharacter(0, 0, w.color, STILL_POSE, false);
+    ctx.restore();
     ctx.fillStyle = "#000";
     ctx.font = "14px sans-serif";
     ctx.fillText("(only " + itSeconds + "s as IT) - next round soon", centerX, 54);
