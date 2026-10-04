@@ -38,6 +38,7 @@
       #join-screen button:hover { background: #ffe14d; }
       #join-screen button:active { transform: translateY(2px); }
       #join-screen p { margin: 0; font-size: 13px; color: #555; }
+      #join-screen #join-error { font: bold 16px sans-serif; color: red; min-height: 20px; } /* keeps its space so nothing jumps */
 
       /* Options: prediction and interpolation on/off, as doodle checkboxes */
       #options { display: flex; gap: 22px; }
@@ -50,17 +51,17 @@
       #options input:checked::after { content: ""; width: 10px; height: 10px; border-radius: 3px; background: #000; }
       #options small { font-weight: normal; color: #555; }
 
-      /* Quit and Keys: stacked in the bottom-left corner of the game, only while playing */
-      #quit-button, #keys-button {
+      /* Menu and Keys: stacked in the bottom-left corner of the game, only while playing */
+      #menu-button, #keys-button {
         position: absolute; left: 10px; bottom: 10px;
         font: bold 14px sans-serif;
         border: 3px solid #000; border-radius: 10px;
         padding: 5px 12px; background: #fff; cursor: pointer;
       }
-      #keys-button { bottom: 50px; } /* just above Quit */
-      #quit-button:hover, #keys-button:hover { background: #ffe14d; }
-      #quit-button:active, #keys-button:active { transform: translateY(2px); }
-      #quit-button.hidden, #keys-button.hidden { display: none; }
+      #keys-button { bottom: 50px; } /* just above Menu */
+      #menu-button:hover, #keys-button:hover { background: #ffe14d; }
+      #menu-button:active, #keys-button:active { transform: translateY(2px); }
+      #menu-button.hidden, #keys-button.hidden { display: none; }
 
       /* Key guide: shown over the game the first time you press Play (see game.js).
          Clicks pass through everywhere except the button, so you can play while it's up. */
@@ -104,6 +105,8 @@
           <button type="submit">Play</button>
         </form>
         <p>Up to 16 letters, numbers, spaces or _</p>
+        <!-- Filled in by game.js if the server turns the name down -->
+        <p id="join-error" role="alert"></p>
         <!-- Netcode options, to compare how the game feels with and without them -->
         <div id="options">
           <label title="Your character moves the instant you press a key, instead of waiting for the server">
@@ -116,7 +119,7 @@
       </div>
 
       <!-- Back to the start screen (hidden until we press Play) -->
-      <button id="quit-button" class="hidden" type="button">Quit</button>
+      <button id="menu-button" class="hidden" type="button">Menu</button>
       <!-- Opens (or closes) the key guide below -->
       <button id="keys-button" class="hidden" type="button">Keys</button>
 

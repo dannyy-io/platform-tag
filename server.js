@@ -177,13 +177,24 @@ const players = {};
 // The browser sends the name its player typed, but we never trust it: anyone can send anything.
 // A good name is 1-16 characters of letters, numbers, spaces and underscores, and isn't all spaces.
 // Anything else (too long, odd symbols, not even text) gets "Player" plus a number instead.
+// No two players can have the same name (ignoring capitals, so "Bob" and "bob" count as the same):
+// joining with a name someone already has is turned down (see "join" below).
 const MAX_NAME_LENGTH = 16;
 let nextPlayerNumber = 1;
 
 function checkName(raw) {
   const name = typeof raw === "string" ? raw.trim() : "";
   const ok = name.length >= 1 && name.length <= MAX_NAME_LENGTH && /^[A-Za-z0-9 _]+$/.test(name);
-  return ok ? name : "Player" + nextPlayerNumber++;
+  if (ok) return name;
+  // Skip any number someone has already typed as their own name (like "Player3").
+  let fallback;
+  do fallback = "Player" + nextPlayerNumber++; while (nameTaken(fallback));
+  return fallback;
+}
+
+function nameTaken(name) {
+  const lower = name.toLowerCase();
+  return Object.values(players).some((p) => p.name.toLowerCase() === lower);
 }
 
 // Red is saved for "it", so normal players get any hue except the reds (roughly 0-30 and 330-360).
@@ -372,11 +383,17 @@ function addPlayer(socket, name) {
 // This runs once for every browser that connects.
 io.on("connection", (socket) => {
   // 1. Nobody is in the game until their browser sends "join" with the name they typed
-  //    (from the start screen). Then we check the name and add them somewhere random.
+  //    (from the start screen). Then we check the name and add them somewhere random,
+  //    or send back "join-rejected" if someone already has that name.
   //    A second "join" from the same browser is ignored.
   socket.on("join", (rawName) => withLag(() => {
     if (players[socket.id] || !socket.connected) return; // already in, or left while lagging
-    addPlayer(socket, checkName(rawName));
+    const name = checkName(rawName);
+    if (nameTaken(name)) {
+      withLag(() => socket.emit("join-rejected", "Name taken"));
+      return;
+    }
+    addPlayer(socket, name);
   }));
 
   // 2. The browser sends one numbered input for every physics step: { seq, tick, left, right, jump, tag }.
@@ -409,8 +426,8 @@ io.on("connection", (socket) => {
     withLag(() => socket.emit("pong-check", sentAt));
   }));
 
-  // 4. When they press Quit (back to the start screen) or close the tab, remove them.
-  //    After quitting they can press Play again, which sends a fresh "join".
+  // 4. When they press Menu (back to the start screen) or close the tab, remove them.
+  //    After that they can press Play again, which sends a fresh "join".
   socket.on("leave", () => withLag(() => removePlayer(socket.id)));
   socket.on("disconnect", () => removePlayer(socket.id));
 });

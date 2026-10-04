@@ -103,7 +103,8 @@ function fitCanvas() {
 
 // ===== Join screen =====
 // We aren't in the game until we type a name and press Play (see index.html).
-// The server checks the name and swaps in "Player" plus a number if it isn't allowed.
+// The server checks the name and swaps in "Player" plus a number if it isn't allowed,
+// or turns us down if someone else already has it.
 const joinScreen = document.getElementById("join-screen");
 const joinForm = document.getElementById("join-form");
 const nameInput = document.getElementById("name-input");
@@ -120,20 +121,45 @@ nameInput.focus();
 const predictionOption = document.getElementById("prediction-option");
 const interpolationOption = document.getElementById("interpolation-option");
 
+// Where we say why the server turned our name down ("Name taken").
+const joinError = document.getElementById("join-error");
+
+// Pressing Play asks the server to let us in. We stay on this screen until it answers:
+// "init" means we're in (see enterGame), "join-rejected" means pick another name.
 joinForm.addEventListener("submit", (e) => {
   e.preventDefault(); // don't reload the page
+  if (myName !== null) return; // already asked: wait for the answer
   myName = nameInput.value;
   try { localStorage.setItem("platform-tag-name", myName); } catch (e) {}
   predictionOn = predictionOption.checked;
   interpolationOn = interpolationOption.checked;
-  nameInput.blur();
-  joinScreen.classList.add("hidden");
-  quitButton.classList.remove("hidden");
-  keysButton.classList.remove("hidden");
-  showKeyGuideFirstTime();
+  joinError.textContent = "";
   if (socket.connected) socket.emit("join", myName);
   // (If we aren't connected yet, the "connect" handler below joins as soon as we are.)
 });
+
+// The server let us in: swap the start screen for the game.
+function enterGame() {
+  nameInput.blur();
+  joinScreen.classList.add("hidden");
+  menuButton.classList.remove("hidden");
+  keysButton.classList.remove("hidden");
+  showKeyGuideFirstTime();
+}
+
+// The server turned us down (someone already has that name): stay here and say why.
+function joinRejected(reason) {
+  myName = null; // so Play can be pressed again, and a reconnect doesn't try this name
+  joinError.textContent = reason;
+  joinScreen.classList.remove("hidden"); // (in case this was a rejoin after a dropped connection)
+  menuButton.classList.add("hidden");
+  keysButton.classList.add("hidden");
+  nameInput.focus();
+  nameInput.select();
+}
+
+// Typing a new name clears the old message.
+nameInput.addEventListener("input", () => { joinError.textContent = ""; });
 
 // ===== Key guide =====
 // The first time this browser presses Play, show which keys do what. It goes away when
@@ -163,7 +189,7 @@ keyGuideClose.addEventListener("click", () => {
   keyGuideClose.blur(); // so pressing Space to tag doesn't "click" it again
 });
 
-// The "Keys" button (above Quit) opens the guide any time, or closes it if it's already open.
+// The "Keys" button (above Menu) opens the guide any time, or closes it if it's already open.
 // Opened this way it stays up until it's closed, instead of going away by itself.
 const keysButton = document.getElementById("keys-button");
 keysButton.addEventListener("click", () => {
@@ -176,12 +202,12 @@ keysButton.addEventListener("click", () => {
   keysButton.blur(); // so pressing Space to tag doesn't "click" it again
 });
 
-// ===== Quit: back to the start screen =====
+// ===== Menu button: back to the start screen =====
 // The server takes our character out of the game, so it disappears for everyone.
 // Pressing Play again joins as a brand new player (new spot, wins back to 0).
-const quitButton = document.getElementById("quit-button");
+const menuButton = document.getElementById("menu-button");
 
-quitButton.addEventListener("click", () => {
+menuButton.addEventListener("click", () => {
   socket.emit("leave");
   myName = null;  // so a reconnect doesn't join us again
   myId = null;    // stops sending inputs (see physicsStep)
@@ -193,7 +219,7 @@ quitButton.addEventListener("click", () => {
   for (const code in keyToAction) setKey(code, false); // let go of every key
   tagPressed = false;
   hideKeyGuide();
-  quitButton.classList.add("hidden");
+  menuButton.classList.add("hidden");
   keysButton.classList.add("hidden");
   joinScreen.classList.remove("hidden");
   nameInput.focus();
@@ -207,6 +233,11 @@ const socket = io();
 // Socket.IO reconnects by itself, but the server sees a brand new player who has to join again.
 socket.on("connect", () => {
   if (myName !== null) socket.emit("join", myName);
+});
+
+socket.on("join-rejected", (reason) => {
+  // Only matters if we're still trying to join (not if we've since pressed Menu).
+  if (myName !== null) joinRejected(String(reason));
 });
 
 // Filled in by the server when we join.
@@ -265,6 +296,8 @@ function estimatedServerTick() {
 // When we join, the server tells us our id, sends the map, and says when it started.
 // (If we reconnect we get a new id and a new spawn spot, so start fresh.)
 socket.on("init", (data) => {
+  if (myName === null) { socket.emit("leave"); return; } // pressed Menu while the join was on its way: back out
+  enterGame();
   myId = data.id;
   map = data.map;
   serverStartTime = data.startTime;
@@ -574,7 +607,7 @@ function setKey(code, held) {
 
 window.addEventListener("keydown", (e) => {
   // On the start screen: let keys work normally there (typing a name, ticking the boxes).
-  if (myName === null) return;
+  if (myId === null) return;
   setKey(e.code, true);
   if (e.code === TAG_KEY && !e.repeat) tagPressed = true; // (holding the key repeats keydown: ignore those)
   // Stop arrow keys / space from scrolling the page
