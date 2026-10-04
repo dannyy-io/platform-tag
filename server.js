@@ -124,8 +124,8 @@ const RESULTS_TIME = 5 * 1000;  // how long the winner is shown before the next 
 const START_COUNTDOWN = 5 * 1000; // once enough players are here, how long until the first round starts (milliseconds)
 const MIN_PLAYERS = 2;          // a round only runs with at least this many players
 // "it" has to press the tag key (Space) to tag someone. Touching alone isn't enough.
-const TAG_WINDOW = 150;   // a press tags anyone "it" touches within this many milliseconds of it (forgives pressing a little early)
-const TAG_COOLDOWN = 400; // after a press, further presses are ignored for this long (milliseconds), so mashing the key doesn't work
+// How long a press lasts and how often you can press are in physics.js, so the browser can tell when a press missed.
+const { TAG_WINDOW, TAG_COOLDOWN } = Physics;
 
 // ===== Powerups =====
 // Pickups that appear on random platforms. Touch one to grab it (see updatePowerups).

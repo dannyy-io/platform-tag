@@ -38,6 +38,11 @@
   const SPEED_BOOST = 1.25;         // speed powerup: move 25% faster
   const JUMP_BOOST = 1.3;           // jump powerup: jump 30% harder (normal jumps only, not orbs or jump pads)
 
+  // ===== Tagging (the server runs the tag rules; the browser uses these to know when a press missed) =====
+  // "it" has to press the tag key (Space) to tag someone. Touching alone isn't enough.
+  const TAG_WINDOW = 150;   // a press tags anyone "it" touches within this many milliseconds of it (forgives pressing a little early)
+  const TAG_COOLDOWN = 400; // after a press, further presses are ignored for this long (milliseconds), so mashing the key doesn't work
+
   // The level isn't in here any more: it lives in maps/*.json. The server loads it and sends it
   // to each browser when they join, and both pass it to stepPlayer().
   // A map is { width, height, platforms: [{ x, y, width, height, type }, ...] }, where type is:
@@ -222,6 +227,8 @@
   exports.ORB_RADIUS = ORB_RADIUS;
   exports.POWERUP_STEPS = POWERUP_STEPS;
   exports.SPEED_BOOST = SPEED_BOOST;
+  exports.TAG_WINDOW = TAG_WINDOW;
+  exports.TAG_COOLDOWN = TAG_COOLDOWN;
   exports.overlaps = overlaps;
   exports.platformPosition = platformPosition;
   exports.stepPlayer = stepPlayer;

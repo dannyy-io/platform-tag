@@ -169,6 +169,7 @@ function joinRejected(reason) {
   keysButton.classList.add("hidden");
   soundButton.classList.add("hidden");
   Sound.setListener(null);
+  Sound.setMusicSpeed(1);
   Sound.playMusic("music_menu");
   nameInput.focus();
   nameInput.select();
@@ -234,12 +235,14 @@ menuButton.addEventListener("click", () => {
   mySpawns = null;
   for (const code in keyToAction) setKey(code, false); // let go of every key
   tagPressed = false;
+  resetMyEventSounds();
   hideKeyGuide();
   menuButton.classList.add("hidden");
   keysButton.classList.add("hidden");
   soundButton.classList.add("hidden");
   joinScreen.classList.remove("hidden");
   Sound.setListener(null);
+  Sound.setMusicSpeed(1);
   Sound.playMusic("music_menu");
   nameInput.focus();
 });
@@ -396,6 +399,7 @@ socket.on("init", (data) => {
   // nothing to compare with yet.
   mySoundMemory = newSoundMemory();
   for (const id in soundMemories) delete soundMemories[id];
+  resetMyEventSounds();
 });
 
 // Recent updates from the server, oldest first: [{ time, players }, ...]
@@ -416,6 +420,7 @@ function renderTime() {
 // 30 times per second, the server sends where everyone is and how the round is going.
 // (All the tag rules run on the server.)
 socket.on("state", (state) => {
+  gameEventSounds(state);
   noticeTag(players, round, state.players, state.round);
   noticeWin(round, state.players, state.round);
   players = state.players; // the newest copy, used for our own player
@@ -531,6 +536,7 @@ function physicsStep() {
   tagPressed = false;
   socket.emit("input", stepInput);
   pendingInputs.push(stepInput);
+  if (stepInput.tag) noticeTagPress(stepInput.seq);
 
   // Normally the server answers long before this fills up. This just stops it growing forever.
   if (pendingInputs.length > 120) pendingInputs.shift();
@@ -538,9 +544,11 @@ function physicsStep() {
   if (predictionOn && predicted) {
     predictedPrev = { x: predicted.x, y: predicted.y };
     const before = soundState(predicted);
+    const wasFrozen = predicted.frozenSteps > 0;
     Physics.stepPlayer(predicted, stepInput, map, currentTick);
     // A brand-new step (never a replayed one, see reconcile): play whatever it made happen.
     movementSounds(mySoundMemory, before, predicted, Physics.STEP_MS / 1000, true);
+    if (wasFrozen && predicted.frozenSteps === 0) myFreezeEnded();
   }
 }
 
@@ -1270,15 +1278,17 @@ function noticeWin(oldRound, newPlayers, newRound) {
 
 // ===== Tags: splash and shake =====
 // The server doesn't announce tags, so we spot them ourselves: if "it" moves to someone else
-// in the middle of a round, that's a tag. (A new round picking a new "it" isn't one.)
+// in the middle of a round and they're frozen, that's a tag. (A new round picking a new "it" isn't
+// one, and neither is a new "it" picked because the old one left: they aren't frozen.)
 function noticeTag(oldPlayers, oldRound, newPlayers, newRound) {
   if (oldRound.phase !== "playing" || newRound.phase !== "playing") return;
   const oldIt = Object.keys(oldPlayers).find((id) => oldPlayers[id].it);
   const newIt = Object.keys(newPlayers).find((id) => newPlayers[id].it);
   if (!oldIt || !newIt || oldIt === newIt) return;
+  const tagged = newPlayers[newIt];
+  if (!tagged.frozen) return;
 
   // Splash where the tagged player is. If that's us, use where we're drawn (our prediction).
-  const tagged = newPlayers[newIt];
   const at = newIt === myId && predictionOn && predicted ? predicted : tagged;
   tagSplash(at.x + playerSize / 2, at.y + playerSize / 2, tagged.color);
 
@@ -1390,6 +1400,174 @@ function drawnPlayerSounds(id, p, dt, mine) {
   }
   movementSounds(mem, mem.last, p, dt, mine);
   mem.last = soundState(p);
+}
+
+// ===== Game event sounds: powerups, tags, countdowns and the end of a round =====
+// The server doesn't announce these either. We spot them by comparing each server update with
+// the one before it (see gameEventSounds), plus two things only our browser knows: when we pressed
+// the tag key, and the moment our own freeze runs out in our prediction.
+// Only a change from one update to the next plays anything, and an update that isn't newer than
+// the last one we compared is skipped, so the same state arriving twice never plays a sound twice.
+const OTHER_EVENT_VOLUME = 0.6; // powerups and tags that happen to other players (distance makes them quieter still)
+const JOIN_VOLUME = 0.5;        // the soft pop when someone joins
+const COUNTDOWN_FROM = 3;       // before a round: countdown_tick on 3, 2, 1, then countdown_go as it starts
+const ROUND_ENDING_TICKS = 5;   // round_ending_tick on each of a round's last 5 seconds
+const FAST_MUSIC_SECONDS = 10;  // the game music speeds up for a round's last 10 seconds...
+const FAST_MUSIC_SPEED = 1.1;   // ...to this speed (1 = normal)
+// Pressing the tag key as "it" with nobody within this many pixels of us (edge to edge) can't tag
+// anyone, so the miss sound plays straight away. Otherwise we wait for the server to say whether it
+// tagged someone. (Two players running at each other close about this much in the time a press
+// takes to reach the server and run out.)
+const WHIFF_SURE_GAP = 200;
+
+// The last server update we compared against: { time, players, round, powerups }. null = none yet.
+let lastEventState = null;
+// Tag key presses waiting for the server to say whether they tagged anyone: [{ seq, ranAt }, ...]
+// seq is the input the press was sent with; ranAt is the server time of the first update that had run it.
+let pendingTagPresses = [];
+// Tag key presses before this time (performance.now()) are ignored, like the server's TAG_COOLDOWN.
+let tagCooldownUntil = 0;
+// True from the moment we're tagged until the unfreeze sound has played, so it plays exactly once.
+let unfreezePending = false;
+
+// Forget our own tag presses and freeze (when we join, or go back to the start screen).
+function resetMyEventSounds() {
+  pendingTagPresses = [];
+  tagCooldownUntil = 0;
+  unfreezePending = false;
+}
+
+// Compare a new server update with the last one and play whatever happened in between.
+// Called for every update, before anything else looks at it.
+function gameEventSounds(state) {
+  const old = lastEventState;
+  if (old && state.time <= old.time) return; // not newer than the last one we compared
+  lastEventState = { time: state.time, players: state.players, round: state.round, powerups: state.powerups || [] };
+
+  const newRound = state.round, me = state.players[myId];
+  // The game music speeds up near the end of a round, and is back to normal everywhere else.
+  const hurry = me && newRound.phase === "playing" && newRound.timeLeft <= FAST_MUSIC_SECONDS * 1000;
+  Sound.setMusicSpeed(hurry ? FAST_MUSIC_SPEED : 1);
+
+  // Only while we're in the game, in this update and the one before. (So joining doesn't sound
+  // like everyone else appearing at once, and nothing from the start screen plays late.)
+  const oldMe = old && old.players[myId];
+  if (!me || !oldMe) return;
+  const oldRound = old.round;
+
+  // Powerups only disappear when someone grabs one.
+  for (const u of old.powerups) {
+    if (lastEventState.powerups.some((v) => v.id === u.id)) continue;
+    const id = powerupGrabber(u, old.players, state.players);
+    if (id) eventSound("powerup_" + u.type, id, u.x, u.y);
+  }
+
+  const midRound = oldRound.phase === "playing" && newRound.phase === "playing";
+  if (midRound) {
+    for (const id in state.players) {
+      const before = old.players[id], p = state.players[id];
+      // Tagged: they just became "it", frozen. (A new "it" picked because the old one left isn't frozen.)
+      if (before && !before.it && p.it && p.frozen) eventSound("tag_freeze", id, p.x + playerSize / 2, p.y + playerSize / 2);
+    }
+  }
+
+  // We just became "it": tagged, or picked at the start of a round.
+  if (!oldMe.it && me.it) Sound.play("you_are_it");
+
+  // Our freeze. It usually ends first in our prediction (see physicsStep); this catches the rest,
+  // like when prediction is off. When the round ends everyone thaws, but win or lose plays instead.
+  if (midRound && !oldMe.frozen && me.frozen) unfreezePending = true;
+  if (newRound.phase !== "playing") unfreezePending = false;
+  else if (oldMe.frozen && !me.frozen) myFreezeEnded();
+
+  // Did our tag key presses tag anyone? A press tags whoever "it" touches within TAG_WINDOW of the
+  // server running it, so once an update from later than that still has us as "it", it missed.
+  pendingTagPresses = pendingTagPresses.filter((press) => {
+    if (newRound.phase !== "playing" || !me.it) return false; // we tagged someone (or the round ended)
+    if (press.ranAt === null && me.lastSeq >= press.seq) press.ranAt = state.time;
+    if (press.ranAt === null || state.time <= press.ranAt + Physics.TAG_WINDOW) return true; // keep waiting
+    Sound.play("tag_whiff");
+    return false;
+  });
+
+  // Countdowns: each whole second the timer reaches.
+  const second = secondReached(oldRound, newRound);
+  const betweenRounds = (r) => r.phase === "starting" || r.phase === "results";
+  if (betweenRounds(newRound) && second >= 1 && second <= COUNTDOWN_FROM) Sound.play("countdown_tick");
+  if (betweenRounds(oldRound) && newRound.phase === "playing") Sound.play("countdown_go");
+  if (newRound.phase === "playing" && second >= 1 && second <= ROUND_ENDING_TICKS) Sound.play("round_ending_tick");
+
+  // The round is over. Only players who were here when it started could win (inRound).
+  if (oldRound.phase === "playing" && newRound.phase === "results" && newRound.winner) {
+    if (newRound.winner.id === myId) Sound.play("win");
+    else if (me.inRound) Sound.play("lose");
+    else Sound.play("round_end");
+  }
+
+  // Someone joined while we're waiting for a round to start. (One pop, even if two joined at once.)
+  if (newRound.phase === "waiting" || newRound.phase === "starting") {
+    if (Object.keys(state.players).some((id) => !old.players[id])) Sound.play("player_join", { volume: JOIN_VOLUME });
+  }
+}
+
+// A sound that happens to one player: at full volume if it's us, otherwise quieter and from where it happened.
+function eventSound(name, id, x, y) {
+  if (id === myId) Sound.play(name);
+  else Sound.play(name, { volume: OTHER_EVENT_VOLUME, x, y });
+}
+
+// Who grabbed powerup u? Grabbing one starts its countdown (speedSteps or jumpSteps) over again,
+// so it's whoever's countdown went up, or if somehow that's more than one player, the nearest.
+// Returns their id, or null.
+function powerupGrabber(u, oldPlayers, newPlayers) {
+  const key = u.type + "Steps";
+  let best = null, bestDistance = Infinity;
+  for (const id in newPlayers) {
+    const before = oldPlayers[id], p = newPlayers[id];
+    if (!before || !(p[key] > before[key])) continue;
+    const distance = Math.hypot(p.x + playerSize / 2 - u.x, p.y + playerSize / 2 - u.y);
+    if (distance < bestDistance) { best = id; bestDistance = distance; }
+  }
+  return best;
+}
+
+// The whole second (5, 4, 3, ...) the round's timer has just reached, or 0 if it's still on the
+// same one. Changing phase starts a new timer, so whatever second it's on counts as just reached.
+function secondReached(oldRound, newRound) {
+  const s = Math.ceil(newRound.timeLeft / 1000);
+  if (oldRound.phase === newRound.phase && Math.ceil(oldRound.timeLeft / 1000) === s) return 0;
+  return s;
+}
+
+// Our freeze just ran out (in our prediction, or in the server's update if that came first).
+function myFreezeEnded() {
+  if (!unfreezePending) return;
+  unfreezePending = false;
+  Sound.play("unfreeze");
+}
+
+// We just sent a tag key press (with input number seq). If the server will count it (we're "it",
+// not frozen, and not pressing again too soon: the same checks as pressTag in server.js), work out
+// whether it missed: straight away if nobody is anywhere near us, otherwise when the server answers.
+function noticeTagPress(seq) {
+  const me = players[myId];
+  const mine = predictionOn && predicted ? predicted : me;
+  if (round.phase !== "playing" || !me || !me.it || !mine) return;
+  if (predictionOn && predicted ? predicted.frozenSteps > 0 : me.frozen) return;
+  const now = performance.now();
+  if (now < tagCooldownUntil) return;
+  tagCooldownUntil = now + Physics.TAG_COOLDOWN;
+
+  const someoneNear = Object.keys(players).some((id) => id !== myId && gapBetween(mine, players[id]) < WHIFF_SURE_GAP);
+  if (someoneNear) pendingTagPresses.push({ seq, ranAt: null });
+  else Sound.play("tag_whiff");
+}
+
+// How far apart two players' squares are, edge to edge (0 = touching or overlapping).
+function gapBetween(a, b) {
+  const dx = Math.max(0, Math.abs(a.x - b.x) - playerSize);
+  const dy = Math.max(0, Math.abs(a.y - b.y) - playerSize);
+  return Math.hypot(dx, dy);
 }
 
 // Seconds of screen shake left (0 = not shaking).

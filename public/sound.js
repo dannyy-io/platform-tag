@@ -17,6 +17,7 @@
 //   Sound.play("jump")                                    // at full volume, in the middle
 //   Sound.play("land", { volume: 0.5, x: 1200, y: 300 })  // quieter, from that spot on the map
 //   Sound.playMusic("music_game")                         // crossfade to this track
+//   Sound.setMusicSpeed(1.1)                              // play the music 10% faster (1 = normal)
 
 (function (exports) {
   // ===== Tweakable constants (try changing these!) =====
@@ -34,6 +35,7 @@
   // Music
   const MUSIC_FADE_SECONDS = 1;  // how long the crossfade between the two tracks takes
   const MUSIC_TRACK_VOLUME = { music_menu: 0.8, music_game: 0.45 }; // the game music is kept quiet
+  const MUSIC_SPEED_GLIDE = 0.15; // roughly how many seconds a change of music speed takes to glide there
   // MP3 files get a few milliseconds of silence added at the start and end when they're made,
   // which would leave a gap every time the music loops. We skip it (see loopPoints).
   const LOOP_SILENCE_LEVEL = 0.001; // samples quieter than this (full volume is 1) count as silence
@@ -136,10 +138,12 @@
   }
 
   // ===== Unlocking =====
-  // Browsers won't let a page make any sound until the player has clicked or pressed a key,
+  // Browsers usually won't let a page make any sound until the player has clicked or pressed a key,
   // so the AudioContext starts out "suspended". The first click or key press anywhere (pressing
   // Play counts too) wakes it up. Until then, play() does nothing (instead of saving every
   // sound up and blasting them all at once).
+  // Some browsers allow sound straight away (Chrome does on sites you use a lot): then the context
+  // is already "running" and the music starts without waiting for a click.
   let unlocked = false;
 
   function unlock() {
@@ -149,13 +153,23 @@
     if (wantedMusic) playMusic(wantedMusic);
   }
 
-  // Keep listening until it has really started (some keys, like Escape, don't count).
-  const GESTURES = ["pointerdown", "keydown", "touchend"];
+  // Every click or key press tries to wake it up if it isn't running, not just the first: some
+  // don't count (like Escape), and the browser can suspend it again later (Safari does when you
+  // switch tabs or take a call, and the sound device changing can too).
+  // Browsers disagree on which events count, so we listen to all the likely ones.
+  const GESTURES = ["pointerdown", "mousedown", "click", "keydown", "touchend"];
   if (ctx) {
-    for (const type of GESTURES) window.addEventListener(type, unlock, true);
-    ctx.addEventListener("statechange", () => {
-      if (ctx.state === "running") for (const type of GESTURES) window.removeEventListener(type, unlock, true);
+    for (const type of GESTURES) window.addEventListener(type, () => { if (ctx.state !== "running") unlock(); }, true);
+    // However it started running (a click, or the browser allowing it), start the music.
+    ctx.addEventListener("statechange", () => { if (ctx.state === "running") unlock(); });
+    // Coming back to the tab: try again, in case it was suspended while we were away.
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible" && ctx.state !== "running") ctx.resume().catch(() => {});
     });
+    // Ask straight away, too. If the browser allows sound without a click, this starts it;
+    // if not, nothing happens and we wait for a click.
+    if (ctx.state === "running") unlocked = true;
+    else ctx.resume().catch(() => {});
   }
 
   // ===== Where we're listening from =====
@@ -242,6 +256,7 @@
   // One track loops at a time. Switching fades the old one out while the new one fades in.
   let wantedMusic = null;  // the track that should be playing (even if it can't start yet)
   let currentMusic = null; // the track actually playing: { name, source, gain }
+  let musicSpeed = 1;      // 1 = normal speed. Faster also sounds higher, like speeding up a record.
 
   function playMusic(name) {
     wantedMusic = name;
@@ -259,6 +274,7 @@
     // Loop only the part between the silences, so it goes round with no gap.
     source.loopStart = loop.start;
     source.loopEnd = loop.end;
+    source.playbackRate.value = musicSpeed;
 
     const gain = ctx.createGain();
     gain.gain.setValueAtTime(0, now);
@@ -279,6 +295,13 @@
     music.source.onended = () => music.gain.disconnect();
   }
 
+  // Speed the music up or slow it down (1 = normal). It glides there instead of jumping.
+  function setMusicSpeed(speed) {
+    if (speed === musicSpeed) return;
+    musicSpeed = speed;
+    if (ctx && currentMusic) currentMusic.source.playbackRate.setTargetAtTime(speed, ctx.currentTime, MUSIC_SPEED_GLIDE / 3);
+  }
+
   // ===== Changing the settings =====
   function setMusicVolume(value) { settings.music = clamp(value, 0, 1); applySettings(); saveSettings(); }
   function setEffectsVolume(value) { settings.effects = clamp(value, 0, 1); applySettings(); saveSettings(); }
@@ -294,6 +317,7 @@
   exports.setListener = setListener;
   exports.play = play;
   exports.playMusic = playMusic;
+  exports.setMusicSpeed = setMusicSpeed;
   exports.setMusicVolume = setMusicVolume;
   exports.setEffectsVolume = setEffectsVolume;
   exports.setMuted = setMuted;
