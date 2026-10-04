@@ -11,6 +11,7 @@ const LAND_DUST_COUNT = 6;       // dust puffs when landing from a full-height f
 const RUN_DUST_CHANCE = 0.3;     // chance (0 to 1) of a dust puff on each running footstep
 const TAG_SPLASH_COUNT = 18;     // paint drops splashed in the tagged player's color
 const JUMPPAD_BURST_COUNT = 10;  // sparks when someone bounces off a jump pad
+const ORB_BURST_COUNT = 12;      // sparks when someone jumps off a jump orb
 const WIN_CONFETTI_COUNT = 40;   // confetti pieces that pop out of the winner when a round ends
 const MAX_PARTICLES = 300;       // never keep more than this many at once, just in case
 const SPLAT_LIFETIME = 4;        // seconds a paint splat (trail or landing) takes to fade away completely
@@ -342,6 +343,8 @@ function reconcile(me) {
     onGround: me.onGround,
     standingOn: me.standingOn,
     frozenSteps: me.frozenSteps,
+    jumpHeld: me.jumpHeld,
+    usedOrb: me.usedOrb,
   };
   // 2. ...then replay every input the server hasn't got to yet, each on the same tick as before.
   for (const input of pendingInputs) {
@@ -443,6 +446,7 @@ function playersToDraw() {
       x, y,
       vx: predicted.vx, vy: predicted.vy, onGround: predicted.onGround, // for the animations
       standingOn: predicted.standingOn, // for paint splats
+      usedOrb: predicted.usedOrb, // to flash an orb the moment we use it
       frozen: predicted.frozenSteps > 0,
     };
   } else if (mine) {
@@ -750,6 +754,71 @@ function drawSpring(x, y, w, squish) {
   ctx.stroke();
 }
 
+// ===== Jump orbs =====
+// Yellow rings floating in the air: press jump while touching one to jump again (see physics.js).
+// Drawn a little smaller than the area that counts as touching, so it never feels unfair.
+const ORB_DRAW_RADIUS = 13;
+// How brightly each orb is flashing after someone used it, keyed by its index in map.orbs (1 = just used, fades to 0).
+const orbFlash = {};
+
+function drawOrbs(dt) {
+  const t = performance.now() / 1000;
+  (map.orbs || []).forEach((o, i) => {
+    const flash = orbFlash[i] || 0;
+    if (flash > 0) orbFlash[i] = Math.max(0, flash - dt * 3);
+    // A gentle pulse so they catch your eye, plus a pop outward when used
+    const r = ORB_DRAW_RADIUS * (1 + 0.06 * Math.sin(t * 4 + i) + 0.4 * flash);
+
+    // A faint dashed ring, slowly turning, showing roughly how close you need to be
+    ctx.save();
+    ctx.translate(o.x, o.y);
+    ctx.rotate(t * 0.8);
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.25)";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([5, 6]);
+    ctx.beginPath();
+    ctx.arc(0, 0, Physics.ORB_RADIUS + 4, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+
+    // The orb: yellow with a thick outline, a smaller ring inside, and white while flashing
+    ctx.strokeStyle = INK;
+    ctx.lineWidth = OUTLINE_WIDTH;
+    ctx.beginPath();
+    ctx.arc(o.x, o.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffe14d";
+    ctx.fill();
+    if (flash > 0) {
+      ctx.globalAlpha = flash;
+      ctx.fillStyle = "#fff";
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    ctx.stroke();
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(o.x, o.y, r * 0.5, 0, Math.PI * 2);
+    ctx.stroke();
+  });
+}
+
+// Someone just jumped off orb number i: flash it and throw out a ring of sparks.
+function useOrbEffect(i) {
+  const o = map && map.orbs && map.orbs[i];
+  if (!o) return;
+  orbFlash[i] = 1;
+  for (let k = 0; k < ORB_BURST_COUNT; k++) {
+    const angle = (k / ORB_BURST_COUNT) * Math.PI * 2 + rand(-0.2, 0.2);
+    const speed = rand(80, 140);
+    addParticle({
+      x: o.x + Math.cos(angle) * ORB_DRAW_RADIUS, y: o.y + Math.sin(angle) * ORB_DRAW_RADIUS,
+      vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed,
+      drag: 6, size: rand(1.5, 2.5),
+      color: k % 2 === 0 ? "#f2c12e" : "#ffe14d", life: rand(0.25, 0.4),
+    });
+  }
+}
+
 // ===== Paint splats: players leave their color wherever they go =====
 // A trail of blobs while moving along the ground, and a bigger splat (with droplets) where they land.
 // Each one: { platform (index in map.platforms), dx (how far along the platform it is, so splats
@@ -1028,8 +1097,16 @@ function animatePlayer(id, p, dt) {
     a = anims[id] = {
       walkPhase: 0, walkAmount: 0, squash: 0, squashSpeed: 0, eyeX: 0, wasOnGround: p.onGround, lastVy: vy,
       ice: p.frozen ? 1 : 0,
+      lastOrb: p.usedOrb,
     };
   }
+
+  // Just jumped off a jump orb: flash it, and squash a little like bouncing off a jump pad.
+  if (p.usedOrb >= 0 && p.usedOrb !== a.lastOrb) {
+    useOrbEffect(p.usedOrb);
+    a.squashSpeed = LANDING_SQUASH_PUSH;
+  }
+  a.lastOrb = p.usedOrb;
 
   // The ice cube around a frozen player pops in when they're frozen and fades away when they thaw.
   a.ice = approach(a.ice, p.frozen ? 1 : 0, 14, dt);
@@ -1257,6 +1334,7 @@ function drawWorld(dt) {
   for (const p of map.platforms) if (p.type === "moving") drawTrack(p); // tracks go behind everything
   updatePadSprings(dt);
   map.platforms.forEach((p, i) => drawPlatform(p, i, tick));
+  drawOrbs(dt);
 
   // Forget the animations of anyone who has left.
   for (const id in anims) if (!drawn[id]) delete anims[id];

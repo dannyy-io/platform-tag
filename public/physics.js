@@ -25,6 +25,11 @@
   // speed, and only move the rest of the way toward the speed your keys ask for.
   // 0 = just like normal ground, 0.96 = very slippery, 1 = you can never speed up or stop.
   const ICE_SLIPPERINESS = 0.96;
+  // Jump orbs (like Geometry Dash): floating rings you can jump off in mid-air, by pressing
+  // jump while touching one. It has to be a fresh press (holding jump from before doesn't count),
+  // and each orb only works once until you've left it.
+  const ORB_STRENGTH = 12;     // upward speed an orb gives you (a normal jump is 11)
+  const ORB_RADIUS = 20;       // how close you need to be: you're touching it if your square is within this of its center
 
   // The level isn't in here any more: it lives in maps/*.json. The server loads it and sends it
   // to each browser when they join, and both pass it to stepPlayer().
@@ -35,6 +40,8 @@
   //   "jumppad"  - a one-way platform that launches you upward as soon as you land on it
   //   "moving"   - a one-way platform that goes from (x, y) to (toX, toY) and back again,
   //                taking "seconds" for the whole trip. It carries whoever stands on it.
+  // A map can also have jump orbs: orbs: [{ x, y }, ...] (their centers). They aren't platforms:
+  // you pass straight through them.
 
   // ===== Where is a platform at a given tick? =====
   // A tick is one physics step, counted 60 per second since the server started.
@@ -57,8 +64,16 @@
            player.y < p.y + p.height && player.y + PLAYER_SIZE > p.y;
   }
 
+  // Is the player's square touching a jump orb? (The closest point of the square to the orb's
+  // center is within ORB_RADIUS of it.)
+  function touchingOrb(player, orb) {
+    const nearestX = Math.max(player.x, Math.min(orb.x, player.x + PLAYER_SIZE));
+    const nearestY = Math.max(player.y, Math.min(orb.y, player.y + PLAYER_SIZE));
+    return (orb.x - nearestX) ** 2 + (orb.y - nearestY) ** 2 <= ORB_RADIUS * ORB_RADIUS;
+  }
+
   // ===== Move one player one step =====
-  // player: { x, y, vx, vy, onGround, standingOn, frozenSteps }  (this object gets changed)
+  // player: { x, y, vx, vy, onGround, standingOn, frozenSteps, jumpHeld, usedOrb }  (this object gets changed)
   // input:  { left, right, jump }  (true/false for each key)
   // map:    the map from maps/*.json (see above)
   // tick:   which tick this step happens on (only moving platforms care)
@@ -66,9 +81,13 @@
   // standingOn is the index in map.platforms of what we're standing on, or -1 if nothing.
   // frozenSteps counts how many more steps the player is frozen for (after getting tagged).
   // It's counted in steps, not seconds, so the browser can predict exactly when the freeze ends.
+  // jumpHeld is whether jump was held last step (so we can tell a fresh press for orbs), and
+  // usedOrb is the index in map.orbs of the orb we last jumped off, until we stop touching it (-1 = none).
   function stepPlayer(player, input, map, tick) {
     const frozen = player.frozenSteps > 0;
     if (frozen) player.frozenSteps--;
+    const jumpPressed = !frozen && input.jump && !player.jumpHeld;
+    player.jumpHeld = input.jump;
 
     // What we were standing on at the end of the last step (undefined if nothing).
     const ground = player.onGround ? map.platforms[player.standingOn] : undefined;
@@ -86,7 +105,23 @@
       player.vx = wantedVx; // everywhere else (including in the air) speed changes instantly
     }
 
-    // 2. Jump, but only if standing on something
+    // 2a. Jump orbs: pressing jump while touching one launches us, even in mid-air.
+    //     An orb we just used doesn't work again until we've stopped touching it.
+    const orbs = map.orbs || [];
+    if (player.usedOrb >= 0 && !(orbs[player.usedOrb] && touchingOrb(player, orbs[player.usedOrb]))) {
+      player.usedOrb = -1;
+    }
+    if (jumpPressed) {
+      for (let i = 0; i < orbs.length; i++) {
+        if (i === player.usedOrb || !touchingOrb(player, orbs[i])) continue;
+        player.vy = -ORB_STRENGTH;
+        player.onGround = false; // (so the normal jump below doesn't also happen)
+        player.usedOrb = i;
+        break;
+      }
+    }
+
+    // 2b. Jump, but only if standing on something
     if (!frozen && input.jump && player.onGround) {
       player.vy = -JUMP_STRENGTH; // negative y means "up" on a canvas
     }
@@ -172,6 +207,7 @@
   exports.PLAYER_SIZE = PLAYER_SIZE;
   exports.JUMPPAD_STRENGTH = JUMPPAD_STRENGTH;
   exports.ICE_SLIPPERINESS = ICE_SLIPPERINESS;
+  exports.ORB_RADIUS = ORB_RADIUS;
   exports.overlaps = overlaps;
   exports.platformPosition = platformPosition;
   exports.stepPlayer = stepPlayer;

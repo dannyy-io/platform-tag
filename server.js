@@ -55,6 +55,12 @@ function loadMap(file) {
       throw new Error(file + ": moving platform " + i + " needs a number toX, toY and seconds (seconds above 0)");
     }
   });
+  // Jump orbs are optional: a list of { x, y } centers.
+  if (m.orbs === undefined) m.orbs = [];
+  if (!Array.isArray(m.orbs)) throw new Error(file + ": orbs must be a list");
+  m.orbs.forEach((o, i) => {
+    if (!o || !isNumber(o.x) || !isNumber(o.y)) throw new Error(file + ": orb " + i + " needs a number x and y");
+  });
   console.log(`Loaded map "${m.name || file}" (${m.width}x${m.height}, ${m.platforms.length} platforms)`);
   return m;
 }
@@ -104,6 +110,7 @@ function placePlayer(p, spot) {
   p.vy = 0;
   p.onGround = false; // they land on the platform under them on their next step
   p.standingOn = -1;
+  p.usedOrb = -1;
   p.spawns++;
 }
 
@@ -342,6 +349,8 @@ function addPlayer(socket, name) {
     vx: 0, vy: 0,
     onGround: false,
     standingOn: -1,          // index in map.platforms of what they're standing on (-1 = nothing)
+    jumpHeld: false,         // was jump held on their last step (for jump orbs, see physics.js)
+    usedOrb: -1,             // index in map.orbs of the orb they just jumped off (-1 = none)
     tick: currentTick(),     // the tick their last physics step ran on
     color: randomColor(),
     inputQueue: [],          // inputs received but not run yet, oldest first
@@ -460,7 +469,7 @@ setInterval(() => {
   updateRound(now, elapsed);
 
   // Send what browsers need to draw, plus what your own browser needs to redo its
-  // prediction: vx, vy, onGround, standingOn, frozenSteps, and the number of the last input we ran.
+  // prediction: vx, vy, onGround, standingOn, frozenSteps, jumpHeld, usedOrb, and the number of the last input we ran.
   const state = {
     time: now, // when this update happened (server's clock), so browsers can line updates up in time
     players: {},
@@ -477,6 +486,7 @@ setInterval(() => {
       it: id === round.itId,
       frozen: isFrozen(p),
       vx: p.vx, vy: p.vy, onGround: p.onGround, standingOn: p.standingOn, frozenSteps: p.frozenSteps,
+      jumpHeld: p.jumpHeld, usedOrb: p.usedOrb, // (usedOrb also tells browsers to flash the orb)
       tick: p.tick, // so browsers can draw riders on a moving platform where it is right now
       lastSeq: p.lastSeq,
       spawns: p.spawns, // changes when they respawn, so browsers snap to the new spot
