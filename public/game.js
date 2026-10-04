@@ -592,7 +592,7 @@ const input = { left: false, right: false, jump: false };
 
 // Which keyboard key controls which action.
 // Several keys can do the same thing (A or the left arrow both move left).
-const keyToAction = { ArrowLeft: "left", KeyA: "left", ArrowRight: "right", KeyD: "right", KeyW: "jump" };
+const keyToAction = { ArrowLeft: "left", KeyA: "left", ArrowRight: "right", KeyD: "right", KeyW: "jump", ArrowUp: "jump" };
 
 // The tag key. Unlike the keys above, holding it does nothing: each press is one tag attempt
 // (so "it" can't just hold it down). A press is remembered until the next physics step sends it.
