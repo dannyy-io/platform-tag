@@ -13,10 +13,13 @@ const TAG_SPLASH_COUNT = 18;     // paint drops splashed in the tagged player's 
 const JUMPPAD_BURST_COUNT = 10;  // sparks when someone bounces off a jump pad
 const WIN_CONFETTI_COUNT = 40;   // confetti pieces that pop out of the winner when a round ends
 const MAX_PARTICLES = 300;       // never keep more than this many at once, just in case
-const SPLAT_LIFETIME = 4;        // seconds a landing paint splat takes to fade away completely
+const SPLAT_LIFETIME = 4;        // seconds a paint splat (trail or landing) takes to fade away completely
+const TRAIL_SPLAT_SIZE = 1.4;    // how big the paint trail left while moving on the ground is (1 = the original splat size)
+const TRAIL_SPACING = 36;        // pixels moved between each blob of the paint trail (a blob is up to about 29 wide, so they don't touch)
+const LANDING_SPLAT_SIZE = 1.8;  // how big the paint splat left when landing is
 const TIMER_WARNING_SECONDS = 5; // the round timer turns red when this many seconds (or fewer) are left
 const JUMPPAD_SQUISH_PUSH = 10;  // how hard a bounce squashes a jump pad's spring (bigger = deeper squash, bigger boing)
-const MAX_SPLATS = 80;           // never keep more splats than this (the oldest go first)
+const MAX_SPLATS = 800;          // never keep more splats than this (the oldest go first)
 
 // ===== Doodle style =====
 // The world is drawn like a doodle on notebook paper, to match the characters.
@@ -692,13 +695,16 @@ function drawSpring(x, y, w, squish) {
   ctx.stroke();
 }
 
-// ===== Paint splats: players leave a little blob of their color where they land =====
+// ===== Paint splats: players leave their color wherever they go =====
+// A trail of blobs while moving along the ground, and a bigger splat (with droplets) where they land.
 // Each one: { platform (index in map.platforms), dx (how far along the platform it is, so splats
-// ride along on moving platforms), color, born (performance.now()), blob, drops }
-// Splats always sit on the platform's top edge, since that's the only side you can land on.
+// ride along on moving platforms), color, born (performance.now()), size, blob, drops }
+// Splats always sit on the platform's top edge, since that's the only side you can stand on.
 const splats = [];
 
-function addSplat(platformIndex, feetX, color) {
+// withDrops: also flick two little droplets off to the sides (landing splats only, since a
+// trail of blobs every few pixels would spray droplets everywhere).
+function addSplat(platformIndex, feetX, color, size, withDrops) {
   const p = map && map.platforms[platformIndex];
   if (!p) return;
   const pos = Physics.platformPosition(p, drawTick());
@@ -706,9 +712,26 @@ function addSplat(platformIndex, feetX, color) {
   const blob = [];
   for (let i = 0; i < 9; i++) blob.push(rand(0.7, 1.15));
   // ...plus two little droplets flicked off to the sides.
-  const drops = [-1, 1].map((side) => ({ x: side * rand(10, 15), y: rand(-1, 3), r: rand(1.2, 2.2) }));
+  const drops = !withDrops ? [] : [-1, 1].map((side) => ({ x: side * rand(10, 15), y: rand(-1, 3), r: rand(1.2, 2.2) }));
   if (splats.length >= MAX_SPLATS) splats.shift();
-  splats.push({ platform: platformIndex, dx: feetX - pos.x, color, born: performance.now(), blob, drops });
+  splats.push({ platform: platformIndex, dx: feetX - pos.x, color, born: performance.now(), size, blob, drops });
+}
+
+// Leave a blob of paint every TRAIL_SPACING pixels a player moves along the ground.
+// a is the player's animation memory (see animatePlayer), which remembers where the last blob went.
+// Distance is measured along the platform, so just riding a moving platform doesn't paint.
+function paintTrail(a, p, feetX, landed) {
+  const platform = p.onGround && map && map.platforms[p.standingOn];
+  if (!platform) { a.trailPlatform = null; return; } // in the air: nothing to paint on
+  const along = feetX - Physics.platformPosition(platform, drawTick()).x;
+  if (landed || a.trailPlatform !== p.standingOn) {
+    // Just landed (the landing splat covers this spot) or stepped onto another platform: start here.
+    a.trailPlatform = p.standingOn;
+    a.trailAlong = along;
+  } else if (Math.abs(along - a.trailAlong) >= TRAIL_SPACING) {
+    addSplat(p.standingOn, feetX, p.color, TRAIL_SPLAT_SIZE, false);
+    a.trailAlong = along;
+  }
 }
 
 // Draw the splats on one platform, clipped to the box that was just traced so they look painted on.
@@ -724,17 +747,18 @@ function drawSplats(index, x, y) {
     ctx.fillStyle = s.color;
     // A flattened blob, centered just below the platform's top edge
     const cx = x + s.dx, cy = y + 2;
+    const size = s.size;
     ctx.beginPath();
     s.blob.forEach((r, i) => {
       const a = (i / s.blob.length) * Math.PI * 2;
-      const px = cx + Math.cos(a) * 9 * r, py = cy + Math.sin(a) * 4.5 * r;
+      const px = cx + Math.cos(a) * 9 * r * size, py = cy + Math.sin(a) * 4.5 * r * size;
       if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
     });
     ctx.closePath();
     ctx.fill();
     for (const d of s.drops) {
       ctx.beginPath();
-      ctx.arc(cx + d.x, cy + d.y, d.r, 0, Math.PI * 2);
+      ctx.arc(cx + d.x * size, cy + d.y * size, d.r * size, 0, Math.PI * 2);
       ctx.fill();
     }
   }
@@ -928,8 +952,8 @@ function shakeOffset(dt) {
 // and all the animation below happens in the browser without touching the physics.
 
 // How hard landing pushes the squash. Bigger = squashes wider on landing.
-// (With the spring in animatePlayer, 3 adds roughly 7% extra width at the peak.)
-const LANDING_SQUASH_PUSH = 3;
+// (With the spring in animatePlayer, 2.1 adds roughly 5% extra width at the peak.)
+const LANDING_SQUASH_PUSH = 2.1;
 
 // Animation memory for each player, keyed by id:
 // { walkPhase, walkAmount, squash, squashSpeed, eyeX, wasOnGround, lastVy }
@@ -986,15 +1010,16 @@ function animatePlayer(id, p, dt) {
   const feetX = p.x + playerSize / 2, feetY = p.y + playerSize;
   if (landed) {
     landingDust(feetX, feetY, a.lastVy);
-    addSplat(p.standingOn, feetX, p.color);
+    addSplat(p.standingOn, feetX, p.color, LANDING_SPLAT_SIZE, true);
   }
+  paintTrail(a, p, feetX, landed);
   if (launched) {
     jumpPadBurst(feetX, feetY);
     kickPadSpring(feetX, feetY);
   }
   let target = 0;
-  if (!p.onGround && vy < 0) target = -0.11 * Math.min(1, -vy / 11); // rising: taller
-  if (!p.onGround && vy > 0) target = 0.08 * Math.min(1, vy / 11);   // falling: wider
+  if (!p.onGround && vy < 0) target = -0.07 * Math.min(1, -vy / 11); // rising: taller
+  if (!p.onGround && vy > 0) target = 0.05 * Math.min(1, vy / 11);   // falling: wider
 
   // squash follows its target like a spring instead of jumping straight there: it starts slowly,
   // speeds up, then eases in, so changing shape looks curved and natural.
