@@ -129,7 +129,15 @@ const joinError = document.getElementById("join-error");
 // "init" means we're in (see enterGame), "join-rejected" means pick another name.
 joinForm.addEventListener("submit", (e) => {
   e.preventDefault(); // don't reload the page
+  Sound.unlock(); // browsers only allow sound after a click or key press, and this is one
   if (myName !== null) return; // already asked: wait for the answer
+  // Odd symbols: say so here, instead of the server quietly swapping in "Player" plus a number.
+  // (A blank name is fine: that's how you ask for a "Player" name.)
+  const typed = nameInput.value.trim();
+  if (typed !== "" && !/^[A-Za-z0-9 _]+$/.test(typed)) {
+    joinRejected("Only letters, numbers, spaces or _");
+    return;
+  }
   myName = nameInput.value;
   try { localStorage.setItem("platform-tag-name", myName); } catch (e) {}
   predictionOn = predictionOption.checked;
@@ -145,16 +153,23 @@ function enterGame() {
   joinScreen.classList.add("hidden");
   menuButton.classList.remove("hidden");
   keysButton.classList.remove("hidden");
+  soundButton.classList.remove("hidden");
   showKeyGuideFirstTime();
+  Sound.playMusic("music_game");
 }
 
-// The server turned us down (someone already has that name): stay here and say why.
+// The name was turned down (by the server because someone already has it, or by the check
+// above): stay here and say why.
 function joinRejected(reason) {
   myName = null; // so Play can be pressed again, and a reconnect doesn't try this name
   joinError.textContent = reason;
+  Sound.play("ui_error");
   joinScreen.classList.remove("hidden"); // (in case this was a rejoin after a dropped connection)
   menuButton.classList.add("hidden");
   keysButton.classList.add("hidden");
+  soundButton.classList.add("hidden");
+  Sound.setListener(null);
+  Sound.playMusic("music_menu");
   nameInput.focus();
   nameInput.select();
 }
@@ -222,9 +237,75 @@ menuButton.addEventListener("click", () => {
   hideKeyGuide();
   menuButton.classList.add("hidden");
   keysButton.classList.add("hidden");
+  soundButton.classList.add("hidden");
   joinScreen.classList.remove("hidden");
+  Sound.setListener(null);
+  Sound.playMusic("music_menu");
   nameInput.focus();
 });
+
+// ===== Sound settings panel =====
+// Music and Effects sliders and a mute button. sound.js does the actual work and remembers them.
+// Opened from the start screen ("Sound" under the options) or in the game (above Keys).
+const soundPanel = document.getElementById("sound-panel");
+const soundButton = document.getElementById("sound-button");
+const soundMenuButton = document.getElementById("sound-menu-button");
+const musicSlider = document.getElementById("music-volume");
+const effectsSlider = document.getElementById("effects-volume");
+const muteButton = document.getElementById("mute-button");
+
+// Show the saved settings. (The sliders go 0-100; sound.js uses 0-1.)
+musicSlider.value = Math.round(Sound.settings.music * 100);
+effectsSlider.value = Math.round(Sound.settings.effects * 100);
+showMuted();
+
+function showMuted() {
+  muteButton.textContent = Sound.settings.muted ? "Unmute" : "Mute";
+  muteButton.setAttribute("aria-pressed", String(Sound.settings.muted));
+}
+
+function toggleSoundPanel() {
+  soundPanel.classList.toggle("hidden");
+  if (!soundPanel.classList.contains("hidden")) hideKeyGuide(); // they'd sit on top of each other
+}
+
+function closeSoundPanel() {
+  soundPanel.classList.add("hidden");
+  // Give the keys back to the game (or the name box), so Space doesn't press a button by accident.
+  if (myId === null && !joinScreen.classList.contains("hidden")) nameInput.focus();
+  else document.activeElement.blur();
+}
+
+soundButton.addEventListener("click", () => { toggleSoundPanel(); soundButton.blur(); });
+soundMenuButton.addEventListener("click", toggleSoundPanel);
+document.getElementById("sound-close").addEventListener("click", closeSoundPanel);
+
+// "input" fires while dragging, so you hear the music change as you go.
+musicSlider.addEventListener("input", () => Sound.setMusicVolume(musicSlider.value / 100));
+effectsSlider.addEventListener("input", () => Sound.setEffectsVolume(effectsSlider.value / 100));
+// Letting go of a slider clicks, which also lets you hear how loud the effects are now.
+musicSlider.addEventListener("change", () => Sound.play("ui_click"));
+effectsSlider.addEventListener("change", () => Sound.play("ui_click"));
+
+muteButton.addEventListener("click", () => {
+  Sound.setMuted(!Sound.settings.muted);
+  showMuted();
+});
+
+// Escape closes it.
+window.addEventListener("keydown", (e) => {
+  if (e.code === "Escape" && !soundPanel.classList.contains("hidden")) closeSoundPanel();
+});
+
+// ===== Click sounds =====
+// Every button and checkbox clicks. (This runs after the button's own click code, so
+// pressing Unmute is heard.) Pressing Enter in the name box "clicks" Play too.
+document.addEventListener("click", (e) => {
+  if (e.target.closest("button, input[type=checkbox]")) Sound.play("ui_click");
+});
+
+// The start screen's music. It can't actually start until the first click or key press.
+Sound.playMusic("music_menu");
 
 // ===== Multiplayer =====
 // Open a live connection to the server we were loaded from.
@@ -616,6 +697,8 @@ function setKey(code, held) {
 window.addEventListener("keydown", (e) => {
   // On the start screen: let keys work normally there (typing a name, ticking the boxes).
   if (myId === null) return;
+  // Same for the sound settings: arrow keys move a slider there, not our player.
+  if (soundPanel.contains(e.target)) return;
   setKey(e.code, true);
   if (e.code === TAG_KEY && !e.repeat) tagPressed = true; // (holding the key repeats keydown: ignore those)
   // Stop arrow keys / space from scrolling the page
@@ -1463,6 +1546,8 @@ function drawTrack(p) {
 function drawWorld(dt) {
   const drawn = playersToDraw();
   if (drawn[myId]) updateCamera(drawn[myId], dt);
+  // Sounds on the map are heard from the middle of our player (see sound.js).
+  if (drawn[myId]) Sound.setListener(drawn[myId].x + playerSize / 2, drawn[myId].y + playerSize / 2);
   if (camera === null) return; // we haven't appeared yet
 
   // Zoom (see fitCanvas), then shift everything we draw from now on by the camera position.

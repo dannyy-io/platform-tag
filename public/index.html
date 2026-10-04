@@ -52,16 +52,16 @@
       #options small { font-weight: normal; color: #555; }
 
       /* Menu and Keys: stacked in the bottom-left corner of the game, only while playing */
-      #menu-button, #keys-button {
+      #menu-button, #keys-button, #sound-button {
         position: absolute; left: 10px; bottom: 10px;
         font: bold 14px sans-serif;
         border: 3px solid #000; border-radius: 10px;
         padding: 5px 12px; background: #fff; cursor: pointer;
       }
       #keys-button { bottom: 50px; } /* just above Menu */
-      #menu-button:hover, #keys-button:hover { background: #ffe14d; }
-      #menu-button:active, #keys-button:active { transform: translateY(2px); }
-      #menu-button.hidden, #keys-button.hidden { display: none; }
+      #menu-button:hover, #keys-button:hover, #sound-button:hover { background: #ffe14d; }
+      #menu-button:active, #keys-button:active, #sound-button:active { transform: translateY(2px); }
+      #menu-button.hidden, #keys-button.hidden, #sound-button.hidden { display: none; }
 
       /* Key guide: shown over the game the first time you press Play (see game.js).
          Clicks pass through everywhere except the button, so you can play while it's up. */
@@ -90,6 +90,29 @@
         padding: 4px 14px; background: #fff; cursor: pointer;
       }
       #key-guide button:hover { background: #ffe14d; }
+
+      /* Sound settings: a card in the middle of the screen, opened from the start screen or in-game */
+      #sound-button { bottom: 90px; } /* just above Keys */
+      #sound-panel {
+        position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+        display: flex; flex-direction: column; gap: 14px;
+        padding: 16px 22px;
+        background: #fff; border: 3px solid #000; border-radius: 12px;
+        font: bold 15px sans-serif;
+      }
+      #sound-panel.hidden { display: none; }
+      #sound-panel h2 { margin: 0; font-size: 18px; text-align: center; }
+      #sound-panel label { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+      #sound-panel input[type="range"] { width: 180px; accent-color: #000; cursor: pointer; }
+      #sound-panel .buttons { display: flex; justify-content: center; gap: 10px; }
+      #sound-panel button {
+        font: bold 14px sans-serif;
+        border: 3px solid #000; border-radius: 10px;
+        padding: 4px 14px; background: #fff; cursor: pointer;
+      }
+      #sound-panel button:hover { background: #ffe14d; }
+      #sound-panel button:active { transform: translateY(2px); }
+      #mute-button[aria-pressed="true"] { background: #ffe14d; } /* stays lit while muted */
     </style>
   </head>
   <body>
@@ -116,12 +139,16 @@
             <input id="interpolation-option" type="checkbox" checked /> Interpolation <small>(other players)</small>
           </label>
         </div>
+        <!-- Opens the sound settings below -->
+        <button id="sound-menu-button" type="button">Sound</button>
       </div>
 
       <!-- Back to the start screen (hidden until we press Play) -->
       <button id="menu-button" class="hidden" type="button">Menu</button>
       <!-- Opens (or closes) the key guide below -->
       <button id="keys-button" class="hidden" type="button">Keys</button>
+      <!-- Opens (or closes) the sound settings below -->
+      <button id="sound-button" class="hidden" type="button">Sound</button>
 
       <!-- How to play (shown the first time you press Play) -->
       <div id="key-guide" class="hidden">
@@ -134,12 +161,25 @@
         </table>
         <button id="key-guide-close" type="button">Got it</button>
       </div>
+
+      <!-- Sound settings (remembered in this browser, see sound.js) -->
+      <div id="sound-panel" class="hidden" role="dialog" aria-label="Sound settings">
+        <h2>Sound</h2>
+        <label>Music <input id="music-volume" type="range" min="0" max="100" /></label>
+        <label>Effects <input id="effects-volume" type="range" min="0" max="100" /></label>
+        <div class="buttons">
+          <button id="mute-button" type="button" aria-pressed="false">Mute</button>
+          <button id="sound-close" type="button">Done</button>
+        </div>
+      </div>
     </div>
 
     <!-- Socket.IO's server automatically serves its browser library at this address -->
     <script src="/socket.io/socket.io.js"></script>
     <!-- The physics, shared with the server, so the browser can predict our own movement -->
     <script src="physics.js"></script>
+    <!-- Loads and plays the sound effects and music -->
+    <script src="sound.js"></script>
     <!-- Load the game code after the canvas exists -->
     <script src="game.js"></script>
   </body>
