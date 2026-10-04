@@ -114,6 +114,7 @@ const FREEZE_TIME = 1.5 * 1000; // how long a newly tagged "it" can't move or ta
 // so the browser can predict exactly which of its inputs will be frozen.
 const FREEZE_STEPS = Math.round(FREEZE_TIME / STEP_MS);
 const RESULTS_TIME = 5 * 1000;  // how long the winner is shown before the next round (milliseconds)
+const START_COUNTDOWN = 5 * 1000; // once enough players are here, how long until the first round starts (milliseconds)
 const MIN_PLAYERS = 2;          // a round only runs with at least this many players
 
 // How often the server updates the world and tells everyone about it.
@@ -182,13 +183,14 @@ function randomColor() {
 
 // ===== Round state =====
 // phase is one of:
-//   "waiting" - fewer than MIN_PLAYERS connected, nothing happens
+//   "waiting"  - fewer than MIN_PLAYERS connected, nothing happens
+//   "starting" - enough players just arrived: counting down to the first round
 //   "playing" - a round is running and someone is "it"
 //   "results" - the round is over and the winner is being shown
 const round = {
   phase: "waiting",
   itId: null,     // socket id of whoever is "it"
-  endsAt: 0,      // when the current phase ends (a Date.now() time), for "playing" and "results"
+  endsAt: 0,      // when the current phase ends (a Date.now() time), for "starting", "playing" and "results"
   winner: null,   // { id, name, color, itTime } of the last round's winner, kept even if they leave
 };
 
@@ -268,9 +270,17 @@ function updateRound(now, elapsed) {
     return;
   }
 
-  // Enough players have joined: start the first round.
+  // Enough players have joined: count down, so nobody is caught off guard by the round starting.
+  // (If someone leaves during the countdown, the check above sends us back to waiting.)
   if (round.phase === "waiting") {
-    startRound();
+    round.phase = "starting";
+    round.endsAt = now + START_COUNTDOWN;
+    return;
+  }
+
+  // Countdown finished: start the first round.
+  if (round.phase === "starting") {
+    if (now >= round.endsAt) startRound();
     return;
   }
 

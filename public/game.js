@@ -1155,6 +1155,12 @@ function drawRoundInfo() {
 
   if (round.phase === "waiting") {
     ctx.fillText("Waiting for another player...", centerX, 30);
+  } else if (round.phase === "starting") {
+    // Enough players are here: count down to the first round. 5, 4, 3, 2, 1 (never 0).
+    const startsIn = Math.max(1, Math.ceil(round.timeLeft / 1000));
+    ctx.fillText("Game starting", centerX, 30);
+    ctx.font = "bold 28px sans-serif";
+    ctx.fillText(String(startsIn), centerX, 62);
   } else if (round.phase === "playing") {
     // Show time left as m:ss, e.g. 0:42
     const seconds = Math.ceil(round.timeLeft / 1000);
