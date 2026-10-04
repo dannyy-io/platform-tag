@@ -2,12 +2,14 @@
 <html>
   <head>
     <meta charset="utf-8" />
+    <!-- On phones, use the real screen width instead of pretending to be a desktop page -->
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Simple Platformer</title>
     <style>
-      /* Center the game on a dark background */
-      body { margin: 0; background: #222; display: flex; justify-content: center; align-items: center; height: 100vh; }
-      #game-area { position: relative; }
-      canvas { display: block; background: #faf8f2; } /* off-white paper (game.js draws the grid on top) */
+      /* The game fills the whole window. (game.js keeps the canvas's pixels matched to its size.) */
+      body { margin: 0; background: #faf8f2; overflow: hidden; }
+      #game-area { position: fixed; inset: 0; }
+      canvas { display: block; width: 100%; height: 100%; background: #faf8f2; } /* off-white paper (game.js draws the grid on top) */
 
       /* ===== Join screen: sits on top of the canvas until we press Play ===== */
       /* Same doodle look as the game: off-white paper with a faint blue grid, thick black rounded outlines. */
@@ -63,7 +65,7 @@
   <body>
     <div id="game-area">
       <!-- The canvas is the "drawing board" our game paints onto every frame -->
-      <canvas id="game" width="800" height="450"></canvas>
+      <canvas id="game"></canvas>
 
       <!-- Before playing: type a name and press Play. (The server double-checks the name.) -->
       <div id="join-screen">

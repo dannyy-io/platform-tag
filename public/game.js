@@ -44,6 +44,59 @@ let predictionOn = true;
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d"); // the "pen" we draw with
 
+// ===== Screen size and zoom =====
+// The canvas fills the whole window, but everyone should see about the same amount of the map,
+// so a big screen doesn't let you spot people from further away. We zoom so that at least
+// VIEW_WIDTH x VIEW_HEIGHT map pixels fit on screen. A screen that's a different shape from 16:9
+// sees a little extra map along its longer side instead of black bars, but never more than
+// MAX_EXTRA_VIEW times as much: past that (very wide, tall or phone-shaped screens) we zoom in
+// a bit more, and the shorter side shows a little less instead.
+const VIEW_WIDTH = 1232;
+const VIEW_HEIGHT = 693;
+const MAX_EXTRA_VIEW = 1.25;
+// The scoreboard, timer and ping are drawn in screen pixels, not map pixels, so they stay a
+// readable size. On big screens they grow a little: 1x at 1280x720, up to MAX_UI_SCALE.
+const MAX_UI_SCALE = 2;
+
+// Filled in by fitCanvas:
+// worldScale: canvas pixels per map pixel
+// width, height: how many map pixels are visible
+// uiScale: canvas pixels per scoreboard/timer pixel
+// uiWidth: how wide the screen is in scoreboard/timer pixels
+const view = { worldScale: 1, width: VIEW_WIDTH, height: VIEW_HEIGHT, uiScale: 1, uiWidth: 0 };
+
+// Called every frame, so it catches every way the size can change: resizing the window,
+// fullscreen (F11), rotating a phone, browser zoom, or dragging to a screen with a different
+// devicePixelRatio. It only does any work when something actually changed.
+let fittedSize = null;
+function fitCanvas() {
+  const cssWidth = Math.max(1, canvas.clientWidth);   // size on the page, in CSS pixels
+  const cssHeight = Math.max(1, canvas.clientHeight);
+  const dpr = window.devicePixelRatio || 1;            // real screen pixels per CSS pixel
+  const size = cssWidth + "x" + cssHeight + "@" + dpr;
+  if (size === fittedSize) return;
+  fittedSize = size;
+
+  // Give the canvas one pixel for every real screen pixel, so it stays sharp on high-resolution
+  // screens. (Changing the size also wipes the canvas, which is why we don't do it every frame.)
+  canvas.width = Math.round(cssWidth * dpr);
+  canvas.height = Math.round(cssHeight * dpr);
+
+  // Zoom so the whole VIEW_WIDTH x VIEW_HEIGHT fits ("min" picks whichever side is tighter)...
+  let scale = Math.min(canvas.width / VIEW_WIDTH, canvas.height / VIEW_HEIGHT);
+  // ...but zoom in further if that would show too much extra along the longer side.
+  scale = Math.max(scale,
+    canvas.width / (VIEW_WIDTH * MAX_EXTRA_VIEW),
+    canvas.height / (VIEW_HEIGHT * MAX_EXTRA_VIEW));
+  view.worldScale = scale;
+  view.width = canvas.width / scale;
+  view.height = canvas.height / scale;
+
+  const ui = Math.min(MAX_UI_SCALE, Math.max(1, Math.min(cssWidth / 1280, cssHeight / 720)));
+  view.uiScale = dpr * ui;
+  view.uiWidth = canvas.width / view.uiScale;
+}
+
 // ===== Join screen =====
 // We aren't in the game until we type a name and press Play (see index.html).
 // The server checks the name and swaps in "Player" plus a number if it isn't allowed.
@@ -475,12 +528,12 @@ window.addEventListener("blur", () => {
 // ===== Camera: smoothly follow our own player =====
 // dt is how many seconds passed since the last frame.
 function updateCamera(me, dt) {
-  // Where the camera wants to be: our player in the middle of the canvas...
-  let targetX = me.x + playerSize / 2 - canvas.width / 2;
-  let targetY = me.y + playerSize / 2 - canvas.height / 2;
+  // Where the camera wants to be: our player in the middle of the screen...
+  let targetX = me.x + playerSize / 2 - view.width / 2;
+  let targetY = me.y + playerSize / 2 - view.height / 2;
   // ...but never showing past the map's edges.
-  targetX = Math.max(0, Math.min(map.width - canvas.width, targetX));
-  targetY = Math.max(0, Math.min(map.height - canvas.height, targetY));
+  targetX = keepInsideMap(targetX, view.width, map.width);
+  targetY = keepInsideMap(targetY, view.height, map.height);
 
   if (camera === null) {
     camera = { x: targetX, y: targetY }; // first frame: jump straight there
@@ -494,6 +547,13 @@ function updateCamera(me, dt) {
   camera.y += (targetY - camera.y) * amount;
 }
 
+// Keep the camera's left (or top) edge from showing past the map. If the map is smaller than
+// the screen in that direction, there's no way to avoid it, so center the map instead.
+function keepInsideMap(cameraPos, viewSize, mapSize) {
+  if (viewSize >= mapSize) return (mapSize - viewSize) / 2;
+  return Math.max(0, Math.min(mapSize - viewSize, cameraPos));
+}
+
 // ===== Draw: run any physics steps that are due, then paint the world =====
 let lastDrawTime = performance.now();
 
@@ -504,11 +564,16 @@ function draw() {
   const dt = Math.min(0.1, (now - lastDrawTime) / 1000); // seconds (capped, in case the tab was hidden)
   lastDrawTime = now;
 
+  fitCanvas(); // in case the window changed size
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0); // plain canvas pixels
   ctx.fillStyle = PAPER_COLOR; // wipe last frame with a fresh sheet of paper
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   if (map) drawWorld(dt);
 
+  // Everything from here on is drawn in screen ("UI") pixels, fixed to the screen's edges.
+  ctx.setTransform(view.uiScale, 0, 0, view.uiScale, 0, 0);
   drawRoundInfo();
   drawScoreboard();
   drawPing();
@@ -684,7 +749,7 @@ function drawGrid() {
   // (One extra square on every side, so a screen shake never shows a gap.)
   const left = Math.floor(camera.x / GRID_SIZE - 1) * GRID_SIZE;
   const top = Math.floor(camera.y / GRID_SIZE - 1) * GRID_SIZE;
-  const right = camera.x + canvas.width + GRID_SIZE, bottom = camera.y + canvas.height + GRID_SIZE;
+  const right = camera.x + view.width + GRID_SIZE, bottom = camera.y + view.height + GRID_SIZE;
   ctx.strokeStyle = GRID_COLOR;
   ctx.lineWidth = 1;
   ctx.beginPath();
@@ -1097,12 +1162,14 @@ function drawWorld(dt) {
   if (drawn[myId]) updateCamera(drawn[myId], dt);
   if (camera === null) return; // we haven't appeared yet
 
-  // Shift everything we draw from now on by the camera position. A platform at map x = 1000
-  // with the camera at x = 900 lands at canvas x = 100. (No rounding to whole pixels: the players
-  // aren't rounded, so a rounded camera made them wobble back and forth by a pixel.)
+  // Zoom (see fitCanvas), then shift everything we draw from now on by the camera position.
+  // A platform at map x = 1000 with the camera at x = 900 lands 100 map pixels from the left edge.
+  // (No rounding to whole pixels: the players aren't rounded, so a rounded camera made them
+  // wobble back and forth by a pixel.)
   // A screen shake nudges the whole world, but not the timer and ping drawn after it.
   const shake = shakeOffset(dt);
   ctx.save();
+  ctx.setTransform(view.worldScale, 0, 0, view.worldScale, 0, 0);
   ctx.translate(-camera.x + shake.x, -camera.y + shake.y);
 
   const tick = drawTick();
@@ -1126,15 +1193,18 @@ function drawWorld(dt) {
 
     // Labels stack upward above the character: their name first (ours in bold), then "IT" above that.
     // Each gets a white edge so it stays readable over platforms and outlines.
+    // On small screens the world is zoomed out, so labels are scaled back up to stay readable
+    // (never smaller on screen than 12px, the same as the scoreboard).
+    const labelSize = Math.max(1, view.uiScale / view.worldScale);
     ctx.textAlign = "center";
     ctx.lineJoin = "round";
     let labelY = p.y - 8;
-    ctx.font = (id === myId ? "bold " : "") + "12px sans-serif";
-    outlinedText(p.name || "", p.x + playerSize / 2, labelY, "#000");
-    labelY -= 14;
+    ctx.font = (id === myId ? "bold " : "") + 12 * labelSize + "px sans-serif";
+    outlinedText(p.name || "", p.x + playerSize / 2, labelY, "#000", 3 * labelSize);
+    labelY -= 14 * labelSize;
     if (p.it) {
-      ctx.font = "bold 14px sans-serif";
-      outlinedText("IT", p.x + playerSize / 2, labelY, "red");
+      ctx.font = "bold " + 14 * labelSize + "px sans-serif";
+      outlinedText("IT", p.x + playerSize / 2, labelY, "red", 3 * labelSize);
     }
   }
 
@@ -1151,7 +1221,7 @@ function drawRoundInfo() {
   ctx.textAlign = "center";
   ctx.fillStyle = "#000";
   ctx.font = "bold 20px sans-serif";
-  const centerX = canvas.width / 2;
+  const centerX = view.uiWidth / 2;
 
   if (round.phase === "waiting") {
     ctx.fillText("Waiting for another player...", centerX, 30);
@@ -1189,9 +1259,9 @@ function drawRoundInfo() {
 }
 
 // Text with a white edge around it, in the current font and alignment.
-function outlinedText(text, x, y, color) {
+function outlinedText(text, x, y, color, edgeWidth = 3) {
   ctx.strokeStyle = "#fff";
-  ctx.lineWidth = 3;
+  ctx.lineWidth = edgeWidth;
   ctx.strokeText(text, x, y);
   ctx.fillStyle = color;
   ctx.fillText(text, x, y);
@@ -1222,7 +1292,7 @@ function drawScoreboard() {
   const shown = rows.slice(0, SCOREBOARD_MAX_ROWS);
 
   const rowHeight = 18, padding = 8;
-  const x = canvas.width - SCOREBOARD_WIDTH - 8, y = 8;
+  const x = view.uiWidth - SCOREBOARD_WIDTH - 8, y = 8;
   const height = padding * 2 + rowHeight * (shown.length + 1);
   const itColumn = x + SCOREBOARD_WIDTH - 52;  // right edge of the "IT" column
   const winsColumn = x + SCOREBOARD_WIDTH - padding; // right edge of the "Wins" column
