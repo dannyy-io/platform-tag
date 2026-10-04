@@ -50,16 +50,45 @@
       #options input:checked::after { content: ""; width: 10px; height: 10px; border-radius: 3px; background: #000; }
       #options small { font-weight: normal; color: #555; }
 
-      /* Quit: bottom-left corner of the game, only while playing */
-      #quit-button {
+      /* Quit and Keys: stacked in the bottom-left corner of the game, only while playing */
+      #quit-button, #keys-button {
         position: absolute; left: 10px; bottom: 10px;
         font: bold 14px sans-serif;
         border: 3px solid #000; border-radius: 10px;
         padding: 5px 12px; background: #fff; cursor: pointer;
       }
-      #quit-button:hover { background: #ffe14d; }
-      #quit-button:active { transform: translateY(2px); }
-      #quit-button.hidden { display: none; }
+      #keys-button { bottom: 50px; } /* just above Quit */
+      #quit-button:hover, #keys-button:hover { background: #ffe14d; }
+      #quit-button:active, #keys-button:active { transform: translateY(2px); }
+      #quit-button.hidden, #keys-button.hidden { display: none; }
+
+      /* Key guide: shown over the game the first time you press Play (see game.js).
+         Clicks pass through everywhere except the button, so you can play while it's up. */
+      #key-guide {
+        position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+        display: flex; flex-direction: column; align-items: center; gap: 10px;
+        padding: 14px 20px;
+        background: #fff; border: 3px solid #000; border-radius: 12px;
+        font: 15px sans-serif;
+        pointer-events: none;
+        transition: opacity 0.4s;
+      }
+      #key-guide.hidden { opacity: 0; visibility: hidden; }
+      #key-guide h2 { margin: 0; font-size: 18px; }
+      #key-guide table { border-spacing: 10px 6px; }
+      #key-guide td:first-child { text-align: right; white-space: nowrap; }
+      #key-guide kbd {
+        display: inline-block; min-width: 18px; padding: 2px 7px; text-align: center;
+        font: bold 13px sans-serif;
+        border: 2px solid #000; border-bottom-width: 4px; border-radius: 6px; background: #fffbe6;
+      }
+      #key-guide button {
+        pointer-events: auto;
+        font: bold 14px sans-serif;
+        border: 3px solid #000; border-radius: 10px;
+        padding: 4px 14px; background: #fff; cursor: pointer;
+      }
+      #key-guide button:hover { background: #ffe14d; }
     </style>
   </head>
   <body>
@@ -88,6 +117,19 @@
 
       <!-- Back to the start screen (hidden until we press Play) -->
       <button id="quit-button" class="hidden" type="button">Quit</button>
+      <!-- Opens (or closes) the key guide below -->
+      <button id="keys-button" class="hidden" type="button">Keys</button>
+
+      <!-- How to play (shown the first time you press Play) -->
+      <div id="key-guide" class="hidden">
+        <h2>How to play</h2>
+        <table>
+          <tr><td><kbd>A</kbd> <kbd>D</kbd> or <kbd>&larr;</kbd> <kbd>&rarr;</kbd></td><td>Move</td></tr>
+          <tr><td><kbd>W</kbd></td><td>Jump</td></tr>
+          <tr><td><kbd>Space</kbd></td><td>Tag someone (when you're <b style="color: red">IT</b>)</td></tr>
+        </table>
+        <button id="key-guide-close" type="button">Got it</button>
+      </div>
     </div>
 
     <!-- Socket.IO's server automatically serves its browser library at this address -->

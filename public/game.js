@@ -128,8 +128,51 @@ joinForm.addEventListener("submit", (e) => {
   nameInput.blur();
   joinScreen.classList.add("hidden");
   quitButton.classList.remove("hidden");
+  keysButton.classList.remove("hidden");
+  showKeyGuideFirstTime();
   if (socket.connected) socket.emit("join", myName);
   // (If we aren't connected yet, the "connect" handler below joins as soon as we are.)
+});
+
+// ===== Key guide =====
+// The first time this browser presses Play, show which keys do what. It goes away when
+// "Got it" is pressed, or by itself after KEY_GUIDE_SECONDS.
+const KEY_GUIDE_SECONDS = 12;
+const keyGuide = document.getElementById("key-guide");
+const keyGuideClose = document.getElementById("key-guide-close");
+let keyGuideTimer = null;
+
+function showKeyGuideFirstTime() {
+  // (If browser storage is switched off we can't remember, so it shows on every Play instead.)
+  try {
+    if (localStorage.getItem("platform-tag-seen-keys")) return;
+    localStorage.setItem("platform-tag-seen-keys", "1");
+  } catch (e) {}
+  keyGuide.classList.remove("hidden");
+  keyGuideTimer = setTimeout(hideKeyGuide, KEY_GUIDE_SECONDS * 1000);
+}
+
+function hideKeyGuide() {
+  clearTimeout(keyGuideTimer);
+  keyGuide.classList.add("hidden");
+}
+
+keyGuideClose.addEventListener("click", () => {
+  hideKeyGuide();
+  keyGuideClose.blur(); // so pressing Space to tag doesn't "click" it again
+});
+
+// The "Keys" button (above Quit) opens the guide any time, or closes it if it's already open.
+// Opened this way it stays up until it's closed, instead of going away by itself.
+const keysButton = document.getElementById("keys-button");
+keysButton.addEventListener("click", () => {
+  if (keyGuide.classList.contains("hidden")) {
+    clearTimeout(keyGuideTimer);
+    keyGuide.classList.remove("hidden");
+  } else {
+    hideKeyGuide();
+  }
+  keysButton.blur(); // so pressing Space to tag doesn't "click" it again
 });
 
 // ===== Quit: back to the start screen =====
@@ -147,7 +190,10 @@ quitButton.addEventListener("click", () => {
   camera = null;
   mySpawns = null;
   for (const code in keyToAction) setKey(code, false); // let go of every key
+  tagPressed = false;
+  hideKeyGuide();
   quitButton.classList.add("hidden");
+  keysButton.classList.add("hidden");
   joinScreen.classList.remove("hidden");
   nameInput.focus();
 });
@@ -349,7 +395,10 @@ function physicsStep() {
   else currentTick++;
 
   inputSeq++;
-  const stepInput = { seq: inputSeq, tick: currentTick, left: input.left, right: input.right, jump: input.jump };
+  // tag is only true on the one step after Space was pressed. (Physics ignores it: the server's
+  // tag rules use it, see server.js.)
+  const stepInput = { seq: inputSeq, tick: currentTick, left: input.left, right: input.right, jump: input.jump, tag: tagPressed };
+  tagPressed = false;
   socket.emit("input", stepInput);
   pendingInputs.push(stepInput);
 
@@ -498,7 +547,12 @@ const input = { left: false, right: false, jump: false };
 
 // Which keyboard key controls which action.
 // Several keys can do the same thing (A or the left arrow both move left).
-const keyToAction = { ArrowLeft: "left", KeyA: "left", ArrowRight: "right", KeyD: "right", Space: "jump" };
+const keyToAction = { ArrowLeft: "left", KeyA: "left", ArrowRight: "right", KeyD: "right", KeyW: "jump" };
+
+// The tag key. Unlike the keys above, holding it does nothing: each press is one tag attempt
+// (so "it" can't just hold it down). A press is remembered until the next physics step sends it.
+const TAG_KEY = "Space";
+let tagPressed = false;
 
 // Every key code currently held down.
 const heldKeys = new Set();
@@ -518,6 +572,7 @@ window.addEventListener("keydown", (e) => {
   // On the start screen: let keys work normally there (typing a name, ticking the boxes).
   if (myName === null) return;
   setKey(e.code, true);
+  if (e.code === TAG_KEY && !e.repeat) tagPressed = true; // (holding the key repeats keydown: ignore those)
   // Stop arrow keys / space from scrolling the page
   if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Space"].includes(e.code)) e.preventDefault();
 });
@@ -1264,6 +1319,12 @@ function drawRoundInfo() {
     // The last few seconds turn red, to show time is nearly up.
     if (seconds <= TIMER_WARNING_SECONDS) ctx.fillStyle = "red";
     ctx.fillText(m + ":" + s, centerX, 30);
+    // A reminder while we're "it": touching isn't enough, we have to press the tag key.
+    if (players[myId] && players[myId].it) {
+      ctx.font = "bold 14px sans-serif";
+      ctx.lineJoin = "round";
+      outlinedText("You're IT! Press SPACE to tag", centerX, 52, "red");
+    }
   } else if (round.phase === "results" && round.winner) {
     const w = round.winner;
     const itSeconds = (w.itTime / 1000).toFixed(1);

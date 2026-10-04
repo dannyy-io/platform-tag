@@ -116,6 +116,9 @@ const FREEZE_STEPS = Math.round(FREEZE_TIME / STEP_MS);
 const RESULTS_TIME = 5 * 1000;  // how long the winner is shown before the next round (milliseconds)
 const START_COUNTDOWN = 5 * 1000; // once enough players are here, how long until the first round starts (milliseconds)
 const MIN_PLAYERS = 2;          // a round only runs with at least this many players
+// "it" has to press the tag key (Space) to tag someone. Touching alone isn't enough.
+const TAG_WINDOW = 150;   // a press tags anyone "it" touches within this many milliseconds of it (forgives pressing a little early)
+const TAG_COOLDOWN = 400; // after a press, further presses are ignored for this long (milliseconds), so mashing the key doesn't work
 
 // How often the server updates the world and tells everyone about it.
 // (This is only a target: on Windows, Node's timers are rough and it's really about 21
@@ -132,7 +135,7 @@ const MAX_QUEUED_INPUTS = 30;  // inputs beyond this (half a second's worth) are
 // If a browser stops sending inputs (e.g. its tab is in the background), the server
 // keeps moving that player with no keys held, so they don't hang in mid-air.
 const IDLE_MS = 500;
-const NO_KEYS = { left: false, right: false, jump: false };
+const NO_KEYS = { left: false, right: false, jump: false, tag: false };
 
 // A tiny web server. It sends the files in "public" to the browser,
 // runs the game itself, and sends the results to every browser using Socket.IO.
@@ -256,6 +259,15 @@ function isFrozen(player) {
   return player.frozenSteps > 0;
 }
 
+// The player pressed the tag key. If they're "it" (and can move), they get TAG_WINDOW milliseconds
+// to touch someone (see updateRound). Anyone else pressing it does nothing.
+function pressTag(player, now) {
+  if (round.phase !== "playing" || player.id !== round.itId || isFrozen(player)) return;
+  if (now < player.tagCooldownUntil) return;
+  player.tagCooldownUntil = now + TAG_COOLDOWN;
+  player.tagUntil = now + TAG_WINDOW;
+}
+
 // Do two players' squares overlap?
 function touching(a, b) {
   return a.x < b.x + PLAYER_SIZE && a.x + PLAYER_SIZE > b.x &&
@@ -304,9 +316,13 @@ function updateRound(now, elapsed) {
   // A frozen "it" can't tag anyone, so whoever just tagged them gets a head start.
   if (isFrozen(it)) return;
 
+  // "it" only tags someone shortly after pressing the tag key (see pressTag).
+  if (now > it.tagUntil) return;
+
   for (const id in players) {
     if (id === it.id) continue;
     if (touching(it, players[id])) {
+      it.tagUntil = 0; // that press is used up
       round.itId = id;
       players[id].frozenSteps = FREEZE_STEPS;
       break; // only one tag per tick
@@ -335,6 +351,8 @@ function addPlayer(socket, name) {
     lastInputAt: Date.now(), // when we last heard from this browser
     itTime: 0,       // milliseconds spent as "it" this round
     frozenSteps: 0,  // can't move or tag for this many more of their physics steps
+    tagUntil: 0,          // as "it", they tag anyone they touch until this time (see pressTag)
+    tagCooldownUntil: 0,  // tag key presses before this time are ignored
     inRound: false,  // true if they were here when the round started (only they can win)
     spawns: 0,       // how many times they've been put at a new spot (see placePlayer)
     wins: 0,         // rounds won since they joined
@@ -352,7 +370,8 @@ io.on("connection", (socket) => {
     addPlayer(socket, checkName(rawName));
   }));
 
-  // 2. The browser sends one numbered input for every physics step: { seq, tick, left, right, jump }.
+  // 2. The browser sends one numbered input for every physics step: { seq, tick, left, right, jump, tag }.
+  //    (tag is true on the one step after the tag key was pressed.)
   //    We queue them up and the game loop runs them in order.
   //    We only trust true/false values — anything else counts as "not held".
   //    The number must be a whole number bigger than the last one, or we ignore the input.
@@ -370,6 +389,7 @@ io.on("connection", (socket) => {
       left: input.left === true,
       right: input.right === true,
       jump: input.jump === true,
+      tag: input.tag === true,
     });
   }));
 
@@ -421,6 +441,7 @@ setInterval(() => {
     while (p.inputQueue.length > 0 && p.stepCredit >= 1) {
       const input = p.inputQueue.shift();
       p.tick = allowedTick(input.tick === null ? nowTick : input.tick, nowTick);
+      if (input.tag) pressTag(p, now);
       stepPlayer(p, input, map, p.tick);
       p.lastSeq = input.seq;
       p.stepCredit--;
