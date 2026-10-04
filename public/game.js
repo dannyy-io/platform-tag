@@ -3,6 +3,16 @@
 // fix that guess whenever the server answers, and draw everything.
 // The server is still the boss: it decides where everyone really is, and runs the tag rules.
 
+// ===== Visual effects (try changing these!) =====
+// These are only for looks: they all happen in the browser and never touch the physics.
+const SHAKE_STRENGTH = 4;        // how far (pixels) the screen jumps when you tag or get tagged
+const SHAKE_DURATION = 0.25;     // how long the shake lasts, in seconds (it fades out)
+const LAND_DUST_COUNT = 6;       // dust puffs when landing from a full-height fall (smaller falls make fewer)
+const RUN_DUST_CHANCE = 0.3;     // chance (0 to 1) of a dust puff on each running footstep
+const TAG_SPLASH_COUNT = 18;     // paint drops splashed in the tagged player's color
+const JUMPPAD_BURST_COUNT = 10;  // sparks when someone bounces off a jump pad
+const MAX_PARTICLES = 300;       // never keep more than this many at once, just in case
+
 // ===== Interpolation =====
 // Other players are drawn this many milliseconds in the past, smoothly blended
 // between the two server updates on either side of that moment.
@@ -109,6 +119,7 @@ function renderTime() {
 // 30 times per second, the server sends where everyone is and how the round is going.
 // (All the tag rules run on the server.)
 socket.on("state", (state) => {
+  noticeTag(players, round, state.players, state.round);
   players = state.players; // the newest copy, used for our own player
   round = state.round;
 
@@ -443,6 +454,130 @@ function drawPlatform(p, tick) {
   }
 }
 
+// ===== Particles: dust, paint and sparks =====
+// Little dots that fly out, slow down, fade away and disappear. Positions are in map pixels,
+// speeds in pixels per second. They're only for looks, so each browser makes its own.
+// Each one: { x, y, vx, vy, gravity, drag, size, grow, color, life, maxLife }
+const particles = [];
+
+function addParticle(props) {
+  if (particles.length >= MAX_PARTICLES) particles.shift(); // drop the oldest
+  particles.push({ gravity: 0, drag: 0, grow: 0, ...props, maxLife: props.life });
+}
+
+// A random number between min and max.
+function rand(min, max) {
+  return min + Math.random() * (max - min);
+}
+
+// Soft grey puffs that drift out sideways along the ground, swell a little and fade.
+// The harder we land (fallSpeed), the more puffs. A full jump lands at about 11.
+function landingDust(x, y, fallSpeed) {
+  const count = Math.max(2, Math.round(LAND_DUST_COUNT * Math.min(1, fallSpeed / 11)));
+  for (let i = 0; i < count; i++) {
+    const side = i % 2 === 0 ? -1 : 1; // half go left, half go right
+    addParticle({
+      x: x + side * rand(2, 8), y: y - rand(0, 3),
+      vx: side * rand(25, 70), vy: -rand(5, 25),
+      drag: 5, size: rand(2.5, 4), grow: 5,
+      color: "rgba(235, 228, 215, 0.8)", life: rand(0.3, 0.5),
+    });
+  }
+}
+
+// A single small puff kicked up behind a running player (vx is which way they're running).
+function runningDust(x, y, vx) {
+  addParticle({
+    x, y: y - rand(0, 2),
+    vx: -Math.sign(vx) * rand(10, 30), vy: -rand(8, 20),
+    drag: 4, size: rand(1.5, 2.5), grow: 4,
+    color: "rgba(235, 228, 215, 0.7)", life: rand(0.25, 0.4),
+  });
+}
+
+// Orange and yellow sparks shooting out from a jump pad, mostly sideways and down.
+function jumpPadBurst(x, y) {
+  for (let i = 0; i < JUMPPAD_BURST_COUNT; i++) {
+    const angle = rand(-0.3, Math.PI + 0.3); // 0 = right, PI/2 = down, PI = left
+    const speed = rand(60, 140);
+    addParticle({
+      x: x + rand(-8, 8), y,
+      vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed * 0.5,
+      drag: 6, size: rand(1.5, 2.5),
+      color: i % 2 === 0 ? "#f28c28" : "#f2c12e", life: rand(0.25, 0.4),
+    });
+  }
+}
+
+// Drops of paint in the tagged player's color, flying out in every direction and falling.
+function tagSplash(x, y, color) {
+  for (let i = 0; i < TAG_SPLASH_COUNT; i++) {
+    const angle = rand(0, Math.PI * 2);
+    const speed = rand(60, 180);
+    addParticle({
+      x, y,
+      vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed - 60, // a little upward kick
+      gravity: 500, drag: 1.5, size: rand(1.5, 3.5), grow: -2,
+      color, life: rand(0.4, 0.7),
+    });
+  }
+}
+
+// Move every particle forward by dt seconds, and throw away the ones that have run out.
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const q = particles[i];
+    q.life -= dt;
+    if (q.life <= 0) { particles.splice(i, 1); continue; }
+    const slow = Math.exp(-q.drag * dt); // drag slows it down the same way at any frame rate
+    q.vx *= slow;
+    q.vy = q.vy * slow + q.gravity * dt;
+    q.x += q.vx * dt;
+    q.y += q.vy * dt;
+    q.size = Math.max(0.5, q.size + q.grow * dt);
+  }
+}
+
+function drawParticles() {
+  for (const q of particles) {
+    ctx.globalAlpha = Math.min(1, q.life / q.maxLife * 1.5); // fade out over the last part of its life
+    ctx.fillStyle = q.color;
+    ctx.beginPath();
+    ctx.arc(q.x, q.y, q.size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ===== Tags: splash and shake =====
+// The server doesn't announce tags, so we spot them ourselves: if "it" moves to someone else
+// in the middle of a round, that's a tag. (A new round picking a new "it" isn't one.)
+function noticeTag(oldPlayers, oldRound, newPlayers, newRound) {
+  if (oldRound.phase !== "playing" || newRound.phase !== "playing") return;
+  const oldIt = Object.keys(oldPlayers).find((id) => oldPlayers[id].it);
+  const newIt = Object.keys(newPlayers).find((id) => newPlayers[id].it);
+  if (!oldIt || !newIt || oldIt === newIt) return;
+
+  // Splash where the tagged player is. If that's us, use where we're drawn (our prediction).
+  const tagged = newPlayers[newIt];
+  const at = newIt === myId && predictionOn && predicted ? predicted : tagged;
+  tagSplash(at.x + playerSize / 2, at.y + playerSize / 2, tagged.color);
+
+  // Only shake for tags we're part of: we got tagged, or we did the tagging.
+  if (newIt === myId || oldIt === myId) shakeTimeLeft = SHAKE_DURATION;
+}
+
+// Seconds of screen shake left (0 = not shaking).
+let shakeTimeLeft = 0;
+
+// How far to nudge the camera this frame: a random jiggle that fades out as the shake ends.
+function shakeOffset(dt) {
+  if (shakeTimeLeft <= 0) return { x: 0, y: 0 };
+  shakeTimeLeft = Math.max(0, shakeTimeLeft - dt);
+  const strength = SHAKE_STRENGTH * (shakeTimeLeft / SHAKE_DURATION);
+  return { x: rand(-strength, strength), y: rand(-strength, strength) };
+}
+
 // ===== Characters =====
 // Players are round little characters (see art/character.png), drawn here with shapes.
 // This is ONLY for looks: the physics still uses the same PLAYER_SIZE square as before,
@@ -479,7 +614,12 @@ function animatePlayer(id, p, dt) {
   // Walking: the feet step faster the faster we move (one full left-right cycle every 40 pixels).
   // walkAmount fades from 0 (standing) to 1 (walking) so starting and stopping look smooth.
   const walking = p.onGround && Math.abs(vx) > 0.3;
+  const stepBefore = Math.floor(a.walkPhase / Math.PI);
   if (walking) a.walkPhase += Math.abs(vx) * (1000 / Physics.STEP_MS) * dt * (2 * Math.PI / 40);
+  // Each time a foot comes down (every half cycle), sometimes kick up a little dust behind us.
+  if (walking && Math.floor(a.walkPhase / Math.PI) !== stepBefore && Math.random() < RUN_DUST_CHANCE) {
+    runningDust(p.x + playerSize / 2 - Math.sign(vx) * 6, p.y + playerSize, vx);
+  }
   a.walkAmount = approach(a.walkAmount, walking ? 1 : 0, 12, dt);
 
   // The eyes look a little toward where we're moving, and back to the middle when we stop.
@@ -492,6 +632,13 @@ function animatePlayer(id, p, dt) {
   const bounced = a.lastVy > 2 && vy < -5;
   // (Landing gives the spring below a push, so the squash grows quickly but smoothly.)
   if (landed || bounced) a.squashSpeed = LANDING_SQUASH_PUSH;
+
+  // Puffs and sparks at the feet (see "Particles" below).
+  const feetX = p.x + playerSize / 2, feetY = p.y + playerSize;
+  if (landed) landingDust(feetX, feetY, a.lastVy);
+  // (Landing and jumping again between two updates also counts as "bounced", so only launches
+  // much faster than a normal jump get sparks.)
+  if (bounced && vy < -(Physics.JUMPPAD_STRENGTH + 11) / 2) jumpPadBurst(feetX, feetY);
   let target = 0;
   if (!p.onGround && vy < 0) target = -0.11 * Math.min(1, -vy / 11); // rising: taller
   if (!p.onGround && vy > 0) target = 0.08 * Math.min(1, vy / 11);   // falling: wider
@@ -665,8 +812,10 @@ function drawWorld(dt) {
   // Shift everything we draw from now on by the camera position. A platform at map x = 1000
   // with the camera at x = 900 lands at canvas x = 100. (No rounding to whole pixels: the players
   // aren't rounded, so a rounded camera made them wobble back and forth by a pixel.)
+  // A screen shake nudges the whole world, but not the timer and ping drawn after it.
+  const shake = shakeOffset(dt);
   ctx.save();
-  ctx.translate(-camera.x, -camera.y);
+  ctx.translate(-camera.x + shake.x, -camera.y + shake.y);
 
   const tick = drawTick();
   for (const p of map.platforms) if (p.type === "moving") drawTrack(p); // tracks go behind everything
@@ -700,6 +849,10 @@ function drawWorld(dt) {
       ctx.fillText("IT", p.x + playerSize / 2, labelY);
     }
   }
+
+  // Particles go on top of the players, so paint splashes over whoever got tagged.
+  updateParticles(dt);
+  drawParticles();
 
   // Back to normal canvas coordinates, so the timer and ping stay fixed on screen.
   ctx.restore();
