@@ -31,6 +31,13 @@
   const ORB_STRENGTH = 12;     // upward speed an orb gives you (a normal jump is 11)
   const ORB_RADIUS = 20;       // how close you need to be: you're touching it if your square is within this of its center
 
+  // ===== Powerups (the server spawns them and decides who picks them up) =====
+  // Picking one up sets a countdown of physics steps; while it's above 0 the boost is on.
+  // Counted in steps, like the freeze, so the browser can predict exactly when it runs out.
+  const POWERUP_STEPS = 3 * 60;     // how long a powerup lasts: 3 seconds
+  const SPEED_BOOST = 1.25;         // speed powerup: move 25% faster
+  const JUMP_BOOST = 1.3;           // jump powerup: jump 30% harder (normal jumps only, not orbs or jump pads)
+
   // The level isn't in here any more: it lives in maps/*.json. The server loads it and sends it
   // to each browser when they join, and both pass it to stepPlayer().
   // A map is { width, height, platforms: [{ x, y, width, height, type }, ...] }, where type is:
@@ -83,9 +90,14 @@
   // It's counted in steps, not seconds, so the browser can predict exactly when the freeze ends.
   // jumpHeld is whether jump was held last step (so we can tell a fresh press for orbs), and
   // usedOrb is the index in map.orbs of the orb we last jumped off, until we stop touching it (-1 = none).
+  // speedSteps and jumpSteps count down how many more steps the speed and jump powerups last.
   function stepPlayer(player, input, map, tick) {
     const frozen = player.frozenSteps > 0;
     if (frozen) player.frozenSteps--;
+    const moveSpeed = player.speedSteps > 0 ? MOVE_SPEED * SPEED_BOOST : MOVE_SPEED;
+    const jumpStrength = player.jumpSteps > 0 ? JUMP_STRENGTH * JUMP_BOOST : JUMP_STRENGTH;
+    if (player.speedSteps > 0) player.speedSteps--;
+    if (player.jumpSteps > 0) player.jumpSteps--;
     const jumpPressed = !frozen && input.jump && !player.jumpHeld;
     player.jumpHeld = input.jump;
 
@@ -94,8 +106,8 @@
 
     // 1. Left/right movement based on held keys (a frozen player's keys do nothing)
     let wantedVx = 0;
-    if (!frozen && input.left)  wantedVx = -MOVE_SPEED;
-    if (!frozen && input.right) wantedVx = MOVE_SPEED;
+    if (!frozen && input.left)  wantedVx = -moveSpeed;
+    if (!frozen && input.right) wantedVx = moveSpeed;
     if (ground && ground.type === "ice") {
       // On ice we only drift part of the way toward the speed we want each step,
       // so getting going and stopping both take a while.
@@ -123,7 +135,7 @@
 
     // 2b. Jump, but only if standing on something
     if (!frozen && input.jump && player.onGround) {
-      player.vy = -JUMP_STRENGTH; // negative y means "up" on a canvas
+      player.vy = -jumpStrength; // negative y means "up" on a canvas
     }
 
     // 3. Gravity: always pull downward a little more each step
@@ -208,6 +220,7 @@
   exports.JUMPPAD_STRENGTH = JUMPPAD_STRENGTH;
   exports.ICE_SLIPPERINESS = ICE_SLIPPERINESS;
   exports.ORB_RADIUS = ORB_RADIUS;
+  exports.POWERUP_STEPS = POWERUP_STEPS;
   exports.overlaps = overlaps;
   exports.platformPosition = platformPosition;
   exports.stepPlayer = stepPlayer;

@@ -127,6 +127,59 @@ const MIN_PLAYERS = 2;          // a round only runs with at least this many pla
 const TAG_WINDOW = 150;   // a press tags anyone "it" touches within this many milliseconds of it (forgives pressing a little early)
 const TAG_COOLDOWN = 400; // after a press, further presses are ignored for this long (milliseconds), so mashing the key doesn't work
 
+// ===== Powerups =====
+// Pickups that appear on random platforms. Touch one to grab it (see updatePowerups).
+// What each one does, and for how long, is in physics.js.
+//   "speed" - move 25% faster
+//   "jump"  - jump 30% higher
+const POWERUP_TYPES = ["speed", "jump"];
+const MAX_POWERUPS = 3;               // never more than this many on the map at once
+const POWERUP_SPAWN_TIME = 10 * 1000; // a new one appears this often (milliseconds), while there's room
+const POWERUP_SPACING = 400;          // new ones try to appear at least this far from other powerups and jump orbs
+const POWERUP_SIZE = 28;              // width and height of the square you have to touch to grab one
+
+// The powerups on the map right now: [{ id, type, x, y }, ...] where (x, y) is the center.
+const powerups = [];
+let nextPowerupId = 1;
+// The types take turns (speed, jump, speed, ...) so both appear exactly as often.
+// (Picking at random could give several of one type in a row.)
+let nextPowerupType = 0;
+let nextPowerupAt = Date.now() + POWERUP_SPAWN_TIME;
+
+// A random spot floating just above a platform, away from other powerups and orbs if possible.
+function powerupSpot() {
+  const others = powerups.concat(map.orbs);
+  let spot;
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const s = randomSpawn(); // somewhere a player could stand (top-left of their square)
+    spot = { x: s.x + PLAYER_SIZE / 2, y: s.y + PLAYER_SIZE / 2 - 6 };
+    if (others.every((o) => Math.hypot(o.x - spot.x, o.y - spot.y) >= POWERUP_SPACING)) break;
+  }
+  return spot;
+}
+
+// Runs once per tick: spawn new powerups now and then, and give them to whoever touches them.
+function updatePowerups(now) {
+  if (powerups.length >= MAX_POWERUPS) nextPowerupAt = now + POWERUP_SPAWN_TIME; // full: start counting once one is taken
+  else if (now >= nextPowerupAt) {
+    const type = POWERUP_TYPES[nextPowerupType];
+    nextPowerupType = (nextPowerupType + 1) % POWERUP_TYPES.length;
+    powerups.push({ id: nextPowerupId++, type, ...powerupSpot() });
+    nextPowerupAt = now + POWERUP_SPAWN_TIME;
+  }
+
+  for (let i = powerups.length - 1; i >= 0; i--) {
+    const u = powerups[i];
+    const box = { x: u.x - POWERUP_SIZE / 2, y: u.y - POWERUP_SIZE / 2, width: POWERUP_SIZE, height: POWERUP_SIZE };
+    const taker = Object.values(players).find((p) => overlaps(p, box));
+    if (!taker) continue;
+    // Grabbing one you already have starts its 3 seconds over again.
+    if (u.type === "speed") taker.speedSteps = Physics.POWERUP_STEPS;
+    if (u.type === "jump") taker.jumpSteps = Physics.POWERUP_STEPS;
+    powerups.splice(i, 1);
+  }
+}
+
 // How often the server updates the world and tells everyone about it.
 // (This is only a target: on Windows, Node's timers are rough and it's really about 21
 // per second. That's fine, because how far physics moves depends on the real time that
@@ -233,6 +286,8 @@ function startRound() {
     placePlayer(players[id], spot);
     players[id].itTime = 0;
     players[id].frozenSteps = 0;
+    players[id].speedSteps = 0; // nobody carries a powerup into a new round
+    players[id].jumpSteps = 0;
     players[id].inRound = true;
   }
   round.phase = "playing";
@@ -362,6 +417,8 @@ function addPlayer(socket, name) {
     standingOn: -1,          // index in map.platforms of what they're standing on (-1 = nothing)
     jumpHeld: false,         // was jump held on their last step (for jump orbs, see physics.js)
     usedOrb: -1,             // index in map.orbs of the orb they just jumped off (-1 = none)
+    speedSteps: 0,           // physics steps left on their speed powerup (0 = none)
+    jumpSteps: 0,            // physics steps left on their jump powerup (0 = none)
     tick: currentTick(),     // the tick their last physics step ran on
     color: randomColor(),
     inputQueue: [],          // inputs received but not run yet, oldest first
@@ -484,6 +541,7 @@ setInterval(() => {
   }
 
   updateRound(now, elapsed);
+  updatePowerups(now);
 
   // Send what browsers need to draw, plus what your own browser needs to redo its
   // prediction: vx, vy, onGround, standingOn, frozenSteps, jumpHeld, usedOrb, and the number of the last input we ran.
@@ -495,6 +553,7 @@ setInterval(() => {
       timeLeft: Math.max(0, round.endsAt - Date.now()), // milliseconds left in this phase
       winner: round.winner,
     },
+    powerups: powerups.slice(), // [{ id, type, x, y }, ...] (a copy, in case fake lag sends it after the list changes)
   };
   for (const id in players) {
     const p = players[id];
@@ -504,6 +563,7 @@ setInterval(() => {
       frozen: isFrozen(p),
       vx: p.vx, vy: p.vy, onGround: p.onGround, standingOn: p.standingOn, frozenSteps: p.frozenSteps,
       jumpHeld: p.jumpHeld, usedOrb: p.usedOrb, // (usedOrb also tells browsers to flash the orb)
+      speedSteps: p.speedSteps, jumpSteps: p.jumpSteps,
       tick: p.tick, // so browsers can draw riders on a moving platform where it is right now
       lastSeq: p.lastSeq,
       spawns: p.spawns, // changes when they respawn, so browsers snap to the new spot

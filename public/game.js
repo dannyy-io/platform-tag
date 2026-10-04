@@ -66,8 +66,8 @@ const MAX_UI_SCALE = 2;
 // worldScale: canvas pixels per map pixel
 // width, height: how many map pixels are visible
 // uiScale: canvas pixels per scoreboard/timer pixel
-// uiWidth: how wide the screen is in scoreboard/timer pixels
-const view = { worldScale: 1, width: VIEW_WIDTH, height: VIEW_HEIGHT, uiScale: 1, uiWidth: 0 };
+// uiWidth, uiHeight: how big the screen is in scoreboard/timer pixels
+const view = { worldScale: 1, width: VIEW_WIDTH, height: VIEW_HEIGHT, uiScale: 1, uiWidth: 0, uiHeight: 0 };
 
 // Called every frame, so it catches every way the size can change: resizing the window,
 // fullscreen (F11), rotating a phone, browser zoom, or dragging to a screen with a different
@@ -99,6 +99,7 @@ function fitCanvas() {
   const ui = Math.min(MAX_UI_SCALE, Math.max(1, Math.min(cssWidth / 1280, cssHeight / 720)));
   view.uiScale = dpr * ui;
   view.uiWidth = canvas.width / view.uiScale;
+  view.uiHeight = canvas.height / view.uiScale;
 }
 
 // ===== Join screen =====
@@ -265,6 +266,9 @@ let players = {};
 // { phase: "waiting" | "playing" | "results", timeLeft, winner: { id, color, itTime } | null }
 let round = { phase: "waiting", timeLeft: 0, winner: null };
 
+// The powerups lying around the map, from the server's latest update: [{ id, type, x, y }, ...]
+let powerups = [];
+
 // ===== Prediction state =====
 // Every input we send gets the next number: 1, 2, 3, ...
 let inputSeq = 0;
@@ -331,6 +335,7 @@ socket.on("state", (state) => {
   noticeWin(round, state.players, state.round);
   players = state.players; // the newest copy, used for our own player
   round = state.round;
+  powerups = state.powerups || [];
 
   // Update our guess of the clock difference. Each update arrives a little early or late,
   // so we only move the guess 10% of the way each time. That keeps it from jittering.
@@ -378,6 +383,8 @@ function reconcile(me) {
     frozenSteps: me.frozenSteps,
     jumpHeld: me.jumpHeld,
     usedOrb: me.usedOrb,
+    speedSteps: me.speedSteps,
+    jumpSteps: me.jumpSteps,
   };
   // 2. ...then replay every input the server hasn't got to yet, each on the same tick as before.
   for (const input of pendingInputs) {
@@ -480,6 +487,7 @@ function playersToDraw() {
       vx: predicted.vx, vy: predicted.vy, onGround: predicted.onGround, // for the animations
       standingOn: predicted.standingOn, // for paint splats
       usedOrb: predicted.usedOrb, // to flash an orb the moment we use it
+      speedSteps: predicted.speedSteps, jumpSteps: predicted.jumpSteps, // for the powerup effects
       frozen: predicted.frozenSteps > 0,
     };
   } else if (mine) {
@@ -672,6 +680,7 @@ function draw() {
   drawRoundInfo();
   drawScoreboard();
   drawPing();
+  drawMyPowerups();
 
   requestAnimationFrame(draw); // ask the browser to call us again next frame
 }
@@ -850,6 +859,99 @@ function useOrbEffect(i) {
       color: k % 2 === 0 ? "#f2c12e" : "#ffe14d", life: rand(0.25, 0.4),
     });
   }
+}
+
+// ===== Powerups =====
+// The server spawns them on random platforms and decides who grabs them; physics.js does the boosting.
+// Each type has a color and an icon: three arrows pointing right (speed) or up (jump).
+const POWERUP_COLORS = { speed: "#ff8a3d", jump: "#4db8ff" };
+const POWERUP_DRAW_SIZE = 30; // width and height of the badge, in map pixels
+const POWERUP_BURST_COUNT = 14; // sparks when someone grabs one
+
+// When we first saw each powerup (by id), so new ones pop in instead of just appearing.
+const powerupSeen = {};
+
+function drawPowerups() {
+  const now = performance.now();
+  for (const u of powerups) {
+    if (!powerupSeen[u.id]) powerupSeen[u.id] = now;
+    const grow = Math.min(1, (now - powerupSeen[u.id]) / 250);
+    const pop = grow < 1 ? grow * (1.6 - 0.6 * grow) : 1; // overshoots a little, then settles
+    const bob = Math.sin(now / 300 + u.id) * 3; // floats gently up and down
+    ctx.save();
+    ctx.translate(u.x, u.y + bob);
+    ctx.scale(pop, pop);
+    drawPowerupBadge(u.type, POWERUP_DRAW_SIZE);
+    ctx.restore();
+  }
+  // Forget powerups that are gone.
+  for (const id in powerupSeen) if (!powerups.some((u) => u.id === Number(id))) delete powerupSeen[id];
+}
+
+// A white rounded badge, centered on (0, 0), with the powerup's icon on it.
+function drawPowerupBadge(type, size) {
+  ctx.beginPath();
+  ctx.roundRect(-size / 2, -size / 2, size, size, size * 0.25);
+  ctx.fillStyle = "#fff";
+  ctx.fill();
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = OUTLINE_WIDTH;
+  ctx.stroke();
+  drawPowerupIcon(type, size * 0.36);
+}
+
+// Three arrowheads in a row, centered on (0, 0): pointing right for speed, up for jump.
+// Each is drawn twice, thick black then thinner color on top, so it has an outline like everything else.
+function drawPowerupIcon(type, half) {
+  ctx.save();
+  if (type === "jump") ctx.rotate(-Math.PI / 2); // the same arrows, turned to point up
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  const path = () => {
+    ctx.beginPath();
+    for (const dx of [-0.6, 0, 0.6]) {
+      ctx.moveTo((dx - 0.25) * half, -0.55 * half);
+      ctx.lineTo((dx + 0.25) * half, 0);
+      ctx.lineTo((dx - 0.25) * half, 0.55 * half);
+    }
+  };
+  path();
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = half * 0.55;
+  ctx.stroke();
+  path();
+  ctx.strokeStyle = POWERUP_COLORS[type];
+  ctx.lineWidth = half * 0.28;
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Someone just grabbed a powerup at (x, y): a ring of sparks in its color.
+function powerupBurst(x, y, type) {
+  for (let i = 0; i < POWERUP_BURST_COUNT; i++) {
+    const angle = (i / POWERUP_BURST_COUNT) * Math.PI * 2 + rand(-0.2, 0.2);
+    const speed = rand(90, 160);
+    addParticle({
+      x, y,
+      vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed,
+      drag: 5, size: rand(1.8, 3),
+      color: i % 2 === 0 ? POWERUP_COLORS[type] : "#fff", life: rand(0.3, 0.5),
+    });
+  }
+}
+
+// While a powerup is on: now and then a small spark drifts off the player, in its color.
+// Speed sparks trail out behind; jump sparks fall away underneath.
+function powerupSparkle(p, type) {
+  const cx = p.x + playerSize / 2, cy = p.y + playerSize / 2;
+  const back = -Math.sign(p.vx || 0);
+  addParticle({
+    x: cx + rand(-10, 10), y: cy + rand(-8, 12),
+    vx: type === "speed" ? back * rand(30, 70) : rand(-15, 15),
+    vy: type === "jump" ? rand(30, 60) : rand(-10, 10),
+    drag: 3, size: rand(1.5, 2.5),
+    color: POWERUP_COLORS[type], life: rand(0.3, 0.5),
+  });
 }
 
 // ===== Paint splats: players leave their color wherever they go =====
@@ -1131,7 +1233,18 @@ function animatePlayer(id, p, dt) {
       walkPhase: 0, walkAmount: 0, squash: 0, squashSpeed: 0, eyeX: 0, wasOnGround: p.onGround, lastVy: vy,
       ice: p.frozen ? 1 : 0,
       lastOrb: p.usedOrb,
+      lastSpeedSteps: p.speedSteps || 0, lastJumpSteps: p.jumpSteps || 0,
     };
+  }
+
+  // Powerups: a burst of sparks when one is grabbed (its countdown suddenly jumps up),
+  // then little sparks trailing behind for as long as it lasts.
+  for (const type of ["speed", "jump"]) {
+    const steps = p[type + "Steps"] || 0;
+    const lastKey = type === "speed" ? "lastSpeedSteps" : "lastJumpSteps";
+    if (steps > a[lastKey] + 30) powerupBurst(p.x + playerSize / 2, p.y + playerSize / 2, type);
+    a[lastKey] = steps;
+    if (steps > 0 && Math.random() < dt * 14) powerupSparkle(p, type);
   }
 
   // Just jumped off a jump orb: flash it, and squash a little like bouncing off a jump pad.
@@ -1368,6 +1481,7 @@ function drawWorld(dt) {
   updatePadSprings(dt);
   map.platforms.forEach((p, i) => drawPlatform(p, i, tick));
   drawOrbs(dt);
+  drawPowerups();
 
   // Forget the animations of anyone who has left.
   for (const id in anims) if (!drawn[id]) delete anims[id];
@@ -1557,6 +1671,40 @@ function drawPing() {
   ctx.fillText(label, 18, 25);
   ctx.font = "12px sans-serif";
   ctx.fillText(value, 18 + labelWidth, 25);
+}
+
+// ===== Our powerups, at the bottom middle of the screen =====
+// A badge for each powerup we have, side by side, with a bar underneath that shrinks as it runs out.
+function drawMyPowerups() {
+  const me = predictionOn && predicted ? predicted : players[myId];
+  if (myId === null || !me) return;
+  const active = ["speed", "jump"].filter((type) => (me[type + "Steps"] || 0) > 0);
+  const size = 44, gap = 12, barHeight = 8;
+  const rowWidth = active.length * size + (active.length - 1) * gap;
+  const top = view.uiHeight - 20 - barHeight - 6 - size; // badge, then the bar, 20px up from the bottom edge
+  let x = (view.uiWidth - rowWidth) / 2;
+  for (const type of active) {
+    const steps = me[type + "Steps"];
+    ctx.save();
+    ctx.translate(x + size / 2, top + size / 2);
+    drawPowerupBadge(type, size);
+    ctx.restore();
+
+    const barY = top + size + 6, left = Math.min(1, steps / Physics.POWERUP_STEPS);
+    ctx.beginPath();
+    ctx.roundRect(x, barY, size, barHeight, barHeight / 2);
+    ctx.fillStyle = "#fff";
+    ctx.fill();
+    ctx.save();
+    ctx.clip(); // keep the colored part inside the rounded ends
+    ctx.fillStyle = POWERUP_COLORS[type];
+    ctx.fillRect(x, barY, size * left, barHeight);
+    ctx.restore();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = INK;
+    ctx.stroke();
+    x += size + gap;
+  }
 }
 
 draw(); // start drawing!
