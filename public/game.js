@@ -32,12 +32,12 @@ const OUTLINE_WIDTH = 3;                       // outline thickness, the same as
 // (Our own player is always drawn at the newest position.)
 const INTERP_DELAY_MS = 100;
 
-// Press I to switch interpolation on and off, to compare.
+// Switched on and off with the checkbox on the start screen, to compare.
 let interpolationOn = true;
 
 // ===== Prediction =====
 // Our own player moves the moment we press a key, instead of waiting for the server.
-// Press P to switch prediction on and off, to compare.
+// Switched on and off with the checkbox on the start screen, to compare.
 let predictionOn = true;
 
 // ===== Setup =====
@@ -59,14 +59,41 @@ let myName = null;
 try { nameInput.value = localStorage.getItem("platform-tag-name") || ""; } catch (e) {}
 nameInput.focus();
 
+// The prediction and interpolation checkboxes. They start ticked; we read them when Play is pressed.
+const predictionOption = document.getElementById("prediction-option");
+const interpolationOption = document.getElementById("interpolation-option");
+
 joinForm.addEventListener("submit", (e) => {
   e.preventDefault(); // don't reload the page
   myName = nameInput.value;
   try { localStorage.setItem("platform-tag-name", myName); } catch (e) {}
+  predictionOn = predictionOption.checked;
+  interpolationOn = interpolationOption.checked;
   nameInput.blur();
   joinScreen.classList.add("hidden");
+  quitButton.classList.remove("hidden");
   if (socket.connected) socket.emit("join", myName);
   // (If we aren't connected yet, the "connect" handler below joins as soon as we are.)
+});
+
+// ===== Quit: back to the start screen =====
+// The server takes our character out of the game, so it disappears for everyone.
+// Pressing Play again joins as a brand new player (new spot, wins back to 0).
+const quitButton = document.getElementById("quit-button");
+
+quitButton.addEventListener("click", () => {
+  socket.emit("leave");
+  myName = null;  // so a reconnect doesn't join us again
+  myId = null;    // stops sending inputs (see physicsStep)
+  predicted = null;
+  predictedPrev = null;
+  pendingInputs = [];
+  camera = null;
+  mySpawns = null;
+  for (const code in keyToAction) setKey(code, false); // let go of every key
+  quitButton.classList.add("hidden");
+  joinScreen.classList.remove("hidden");
+  nameInput.focus();
 });
 
 // ===== Multiplayer =====
@@ -432,16 +459,8 @@ function setKey(code, held) {
 }
 
 window.addEventListener("keydown", (e) => {
-  // Typing a name on the join screen: let those keys go into the box, not the game.
-  if (e.target === nameInput) return;
-  // I toggles interpolation. (e.repeat is true for the repeats from holding the key down.)
-  if (e.code === "KeyI" && !e.repeat) interpolationOn = !interpolationOn;
-  // P toggles prediction. Turning it off forgets our guess; turning it back on
-  // rebuilds it from the next server update.
-  if (e.code === "KeyP" && !e.repeat) {
-    predictionOn = !predictionOn;
-    predicted = null;
-  }
+  // On the start screen: let keys work normally there (typing a name, ticking the boxes).
+  if (myName === null) return;
   setKey(e.code, true);
   // Stop arrow keys / space from scrolling the page
   if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Space"].includes(e.code)) e.preventDefault();
@@ -1242,13 +1261,29 @@ function drawScoreboard() {
 }
 
 // ===== Ping in the top-left corner =====
+// A small white card like the scoreboard: "Ping: 23 ms".
 function drawPing() {
+  const label = "Ping: ";
+  const value = (pingMs === null ? "--" : pingMs) + " ms";
+  ctx.font = "bold 12px sans-serif";
+  const labelWidth = ctx.measureText(label).width;
+  ctx.font = "12px sans-serif";
+  const width = labelWidth + ctx.measureText(value).width + 20;
+
+  ctx.beginPath();
+  ctx.roundRect(8, 8, width, 26, 8);
+  ctx.fillStyle = "#fff";
+  ctx.fill();
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = OUTLINE_WIDTH;
+  ctx.stroke();
+
   ctx.textAlign = "left";
   ctx.fillStyle = "#000";
+  ctx.font = "bold 12px sans-serif";
+  ctx.fillText(label, 18, 25);
   ctx.font = "12px sans-serif";
-  ctx.fillText("ping: " + (pingMs === null ? "--" : pingMs) + " ms", 8, 18);
-  ctx.fillText("interpolation: " + (interpolationOn ? "ON" : "OFF") + " (press I)", 8, 34);
-  ctx.fillText("prediction: " + (predictionOn ? "ON" : "OFF") + " (press P)", 8, 50);
+  ctx.fillText(value, 18 + labelWidth, 25);
 }
 
 draw(); // start drawing!

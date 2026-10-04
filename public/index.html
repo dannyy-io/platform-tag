@@ -36,6 +36,28 @@
       #join-screen button:hover { background: #ffe14d; }
       #join-screen button:active { transform: translateY(2px); }
       #join-screen p { margin: 0; font-size: 13px; color: #555; }
+
+      /* Options: prediction and interpolation on/off, as doodle checkboxes */
+      #options { display: flex; gap: 22px; }
+      #options label { display: flex; align-items: center; gap: 8px; font: bold 14px sans-serif; cursor: pointer; }
+      #options input {
+        appearance: none; margin: 0; width: 20px; height: 20px;
+        border: 3px solid #000; border-radius: 6px; background: #fff; cursor: pointer;
+        display: grid; place-content: center;
+      }
+      #options input:checked::after { content: ""; width: 10px; height: 10px; border-radius: 3px; background: #000; }
+      #options small { font-weight: normal; color: #555; }
+
+      /* Quit: bottom-left corner of the game, only while playing */
+      #quit-button {
+        position: absolute; left: 10px; bottom: 10px;
+        font: bold 14px sans-serif;
+        border: 3px solid #000; border-radius: 10px;
+        padding: 5px 12px; background: #fff; cursor: pointer;
+      }
+      #quit-button:hover { background: #ffe14d; }
+      #quit-button:active { transform: translateY(2px); }
+      #quit-button.hidden { display: none; }
     </style>
   </head>
   <body>
@@ -51,7 +73,19 @@
           <button type="submit">Play</button>
         </form>
         <p>Up to 16 letters, numbers, spaces or _</p>
+        <!-- Netcode options, to compare how the game feels with and without them -->
+        <div id="options">
+          <label title="Your character moves the instant you press a key, instead of waiting for the server">
+            <input id="prediction-option" type="checkbox" checked /> Prediction <small>(your movement)</small>
+          </label>
+          <label title="Other players glide smoothly between server updates, instead of jumping">
+            <input id="interpolation-option" type="checkbox" checked /> Interpolation <small>(other players)</small>
+          </label>
+        </div>
       </div>
+
+      <!-- Back to the start screen (hidden until we press Play) -->
+      <button id="quit-button" class="hidden" type="button">Quit</button>
     </div>
 
     <!-- Socket.IO's server automatically serves its browser library at this address -->

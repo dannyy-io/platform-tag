@@ -370,17 +370,23 @@ io.on("connection", (socket) => {
     withLag(() => socket.emit("pong-check", sentAt));
   }));
 
-  // 4. When they close the tab, remove them. The next tick's state won't include them.
-  //    (Their wins go with them: if they come back, they start again from 0.)
-  socket.on("disconnect", () => {
-    delete players[socket.id];
-    // If "it" left mid-round, pick someone else to be "it".
-    // (If too few players are left, updateRound stops the round on the next tick.)
-    if (round.phase === "playing" && round.itId === socket.id && playerCount() > 0) {
-      pickRandomIt();
-    }
-  });
+  // 4. When they press Quit (back to the start screen) or close the tab, remove them.
+  //    After quitting they can press Play again, which sends a fresh "join".
+  socket.on("leave", () => withLag(() => removePlayer(socket.id)));
+  socket.on("disconnect", () => removePlayer(socket.id));
 });
+
+// Take a player out of the game. The next tick's state won't include them, so they vanish
+// from everyone's screen. (Their wins go with them: if they come back, they start again from 0.)
+function removePlayer(id) {
+  if (!players[id]) return; // never joined, or already gone
+  delete players[id];
+  // If "it" left mid-round, pick someone else to be "it".
+  // (If too few players are left, updateRound stops the round on the next tick.)
+  if (round.phase === "playing" && round.itId === id && playerCount() > 0) {
+    pickRandomIt();
+  }
+}
 
 // ===== Game loop: 30 times per second, run everyone's inputs, apply the tag rules, then tell everyone =====
 let lastTick = Date.now();
